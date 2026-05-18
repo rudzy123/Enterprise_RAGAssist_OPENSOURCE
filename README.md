@@ -25,13 +25,14 @@ The system was built to solve a practical problem: enterprise documentation is f
 ## Architecture
 
 ```
-ingestion → embedding → vector DB → retrieval → evaluation
+ingestion → embedding → vector DB → retrieval → rerank → evaluation
 ```
 
 - **Ingestion**: Markdown documents are parsed, chunked, and embedded
 - **Embedding**: SentenceTransformers convert text into vector representations
 - **Vector DB**: ChromaDB stores document vectors and metadata
-- **Retrieval**: Query embeddings search top-k nearest chunks
+- **Retrieval**: Bi-encoder search (`all-MiniLM-L6-v2`) over top candidates (`retrieve_k=15`)
+- **Reranking**: Cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) rescores filtered chunks
 - **Evaluation**: Metrics drive tuning and monitor retrieval quality
 
 ## Tech Stack
@@ -58,12 +59,13 @@ These metrics enable targeted improvements and expose retrieval tradeoffs clearl
 
 This project uses evaluation signals to tune retrieval behavior:
 
-- Top-k was increased to 8 to improve recall without losing focus
-- Retrieval expands candidate results before filtering to preserve coverage
-- A similarity threshold (default `0.3`) removes low-confidence chunks
+- **retrieve_k=15** bi-encoder candidates, **final_k=3** after rerank and caps
+- Cosine similarity threshold (`similarity = 1 - distance`, default `0.40`) filters weak matches (no fallback)
+- **Cross-encoder rerank** (`ms-marco-MiniLM-L-6-v2`) improves ordering before per-document caps
+- Max **2 chunks per source file** to reduce cross-document noise
 - Evaluation feedback balances precision and recall for real data
 
-The result is a retrieval pipeline that favors strong document coverage while reducing low-similarity noise.
+Disable reranking with `RERANK_ENABLED=false` if you need faster CPU-only runs.
 
 ## Performance Results
 

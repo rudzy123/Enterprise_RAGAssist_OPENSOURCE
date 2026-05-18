@@ -23,7 +23,7 @@ sys.path.insert(0, str(project_root))
 
 from retrieval.retrieve_chunks import retrieve_similar_chunks
 
-def generate_answer_with_citations(query: str, api_key: str, top_k: int = 4):
+def generate_answer_with_citations(query: str, api_key: str):
     """
     Generate an answer from retrieved chunks with citations.
     This is a simplified version of the answer_generation module.
@@ -33,7 +33,7 @@ def generate_answer_with_citations(query: str, api_key: str, top_k: int = 4):
     import chromadb
 
     # Step 1: Retrieve relevant chunks
-    retrieved_results = retrieve_similar_chunks(query, top_k=top_k)
+    retrieved_results = retrieve_similar_chunks(query)
 
     if not retrieved_results:
         return "Error: Could not retrieve any chunks from the knowledge base."
@@ -46,7 +46,7 @@ def generate_answer_with_citations(query: str, api_key: str, top_k: int = 4):
         chunk_text = f"""
 Section: {result['section_title']}
 Source: {result['source_file']}
-Content: {result['text_preview']}
+Content: {result['text']}
 """
         context_parts.append(chunk_text)
         source_ref = f"- {result['section_title']} ({result['source_file']})"
@@ -131,7 +131,7 @@ def main():
         with st.spinner("Searching knowledge base..."):
             try:
                 # Always perform retrieval
-                retrieved_results = retrieve_similar_chunks(question, top_k=4)
+                retrieved_results = retrieve_similar_chunks(question)
 
                 if not retrieved_results:
                     st.error("No relevant information found in the knowledge base.")
@@ -140,13 +140,20 @@ def main():
                 # Display retrieved chunks
                 st.header("📄 Retrieved Information")
                 for i, result in enumerate(retrieved_results, 1):
-                    with st.expander(f"📋 Result {i}: {result['section_title']} ({result['similarity_score']:.3f})"):
+                    score_hint = (
+                        f"rerank {result['rerank_score']:.3f}"
+                        if "rerank_score" in result
+                        else f"sim {result['similarity_score']:.3f}"
+                    )
+                    with st.expander(f"📋 Result {i}: {result['section_title']} ({score_hint})"):
                         st.markdown(f"**Source:** {result['source_file']}")
                         st.markdown(f"**Section:** {result['section_title']}")
-                        st.markdown(f"**Similarity:** {result['similarity_score']:.4f}")
+                        st.markdown(f"**Bi-encoder similarity:** {result['similarity_score']:.4f}")
+                        if "rerank_score" in result:
+                            st.markdown(f"**Rerank score:** {result['rerank_score']:.4f}")
                         st.text_area(
                             "Content:",
-                            result['text_preview'],
+                            result['text'],
                             height=100,
                             disabled=True
                         )
@@ -155,7 +162,7 @@ def main():
                 if api_key:
                     st.header("🤖 Generated Answer")
                     with st.spinner("Generating answer..."):
-                        answer = generate_answer_with_citations(question, api_key, top_k=4)
+                        answer = generate_answer_with_citations(question, api_key)
 
                         if "Error calling OpenAI API" in answer:
                             st.error(answer)

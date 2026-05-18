@@ -13,11 +13,14 @@ import openai
 
 from config import (
     DEBUG_MODE,
+    FINAL_K,
     MIN_CHUNK_SIMILARITY,
     MIN_SIMILARITY_THRESHOLD,
     OPENAI_MODEL,
-    TOP_K,
+    RETRIEVE_K,
 )
+from retrieval.retrieve_chunks import retrieve_similar_chunks
+from retrieval.similarity import chunk_similarity_score, max_similarity
 from observability import TraceStore, build_step_log, log_event, setup_json_logger
 
 # -------------------------------------------------
@@ -91,7 +94,7 @@ def determine_failure_type(
     if not retrieved_chunks:
         return "weak_retrieval"
 
-    if top_similarity is not None and top_similarity < 0.35:
+    if top_similarity is not None and top_similarity < MIN_SIMILARITY_THRESHOLD:
         return "weak_retrieval"
 
     low_confidence_text = answer_text.lower()
@@ -150,12 +153,14 @@ def load_curated_markdown(directory: str):
 
 def compute_retrieval_confidence(
     num_docs: int,
-    distances: List[float],
-    metadatas: List[dict]
+    similarity_scores: List[float],
+    metadatas: List[dict],
 ) -> Tuple[float, str]:
     """
     Compute confidence score based on retrieval quality signals.
-    
+
+    ``similarity_scores`` must be cosine similarities (1 - cosine distance).
+
     Confidence Score Ranges:
     - 0.0–0.3:   Weak evidence (system refuses to answer)
     - 0.3–0.6:   Partial evidence (answer given with caution)
@@ -163,11 +168,10 @@ def compute_retrieval_confidence(
     """
     if num_docs == 0:
         return 0.0, "No relevant documents found"
-    
+
     doc_count_score = min(num_docs / 3.0, 1.0)
-    if distances:
-        similarities = [1.0 / (1.0 + d) for d in distances]
-        avg_similarity = sum(similarities) / len(similarities)
+    if similarity_scores:
+        avg_similarity = sum(similarity_scores) / len(similarity_scores)
     else:
         avg_similarity = 0.5
 
@@ -306,7 +310,7 @@ def ingest_docs():
 
 
 @app.post("/ask", response_model=Answer)
-def ask(question: Question, top_k: int = TOP_K):
+def ask(question: Question, final_k: int = FINAL_K):
     """
     Answer questions using retrieved evidence only.
     Confidence is based on retrieval quality (similarity scores, document count, source consolidation).
@@ -322,48 +326,40 @@ def ask(question: Question, top_k: int = TOP_K):
 
     log_step(trace_id, "request_received", {"query": question.question})
 
-    query_embedding = embed(question.question)
-    trace_query = build_step_log("query_embedding_created", {"query_length": len(question.question)})
-    step_logs.append(trace_query)
+    step_logs.append(build_step_log("query_embedding_created", {"query_length": len(question.question)}))
+    log_step(trace_id, "retrieval_started", {"retrieve_k": RETRIEVE_K, "final_k": final_k})
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
+    retrieval = retrieve_similar_chunks(
+        question.question,
+        retrieve_k=RETRIEVE_K,
+        final_k=final_k,
+        return_trace=True,
+        trace_id=trace_id,
     )
-    log_step(trace_id, "retrieval_started", {"n_results": top_k})
 
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+    filtered_chunks = retrieval["chunks"]
+    retrieved_chunks = retrieval["threshold_passed"]
+    raw_candidates = retrieval["raw_candidates"]
 
-    retrieved_chunks = []
-    filtered_chunks = []
-    filtered_distances = []
-    filtered_metas = []
-    filtered_docs = []
-
-    for doc, meta, distance in zip(docs, metas, distances):
-        similarity_score = 1.0 / (1.0 + distance) if distance is not None else None
-        chunk = {
-            "text": doc,
-            "section_title": meta.get("section_title", "unknown"),
-            "source_file": meta.get("source_file", "unknown"),
-            "similarity_score": similarity_score,
-        }
-        retrieved_chunks.append(chunk)
-
-        if similarity_score is not None and similarity_score >= MIN_CHUNK_SIMILARITY:
-            filtered_chunks.append(chunk)
-            filtered_docs.append(doc)
-            filtered_metas.append(meta)
-            filtered_distances.append(distance)
+    filtered_docs = [c["text"] for c in filtered_chunks]
+    filtered_metas = [
+        {"source_file": c["source_file"], "section_title": c["section_title"]}
+        for c in filtered_chunks
+    ]
+    filtered_similarity_scores = [chunk_similarity_score(c) for c in filtered_chunks]
 
     step_logs.append(build_step_log("retrieval_completed", {
-        "retrieved_count": len(retrieved_chunks),
+        "raw_candidate_count": len(raw_candidates),
+        "threshold_passed_count": len(retrieved_chunks),
+        "reranked_count": len(retrieval.get("reranked", [])),
         "filtered_count": len(filtered_chunks),
-        "top_similarity": max((chunk["similarity_score"] for chunk in retrieved_chunks if chunk["similarity_score"] is not None), default=None),
+        "rerank_enabled": retrieval.get("rerank_enabled", False),
+        "top_similarity": max_similarity(
+            [chunk_similarity_score(c) for c in filtered_chunks]
+            or [chunk_similarity_score(c) for c in raw_candidates]
+        ),
         "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
+        "max_chunks_per_file": retrieval["max_chunks_per_file"],
     }))
 
     trace = {
@@ -375,7 +371,7 @@ def ask(question: Question, top_k: int = TOP_K):
         "step_logs": step_logs,
     }
 
-    if not docs:
+    if not raw_candidates:
         answer_text = "I could not find relevant information in the provided documents."
         failure_type = determine_failure_type(retrieved_chunks, 0.0, None, answer_text)
         trace.update({
@@ -430,27 +426,27 @@ def ask(question: Question, top_k: int = TOP_K):
             trace_id=trace_id,
         )
 
-    top_similarity = None
-    if distances:
-        top_distance = min(distances)
-        top_similarity = 1.0 / (1.0 + top_distance)
-        log_step(trace_id, "relevance_scored", {"top_distance": top_distance, "top_similarity": top_similarity})
+    top_similarity = max_similarity(filtered_similarity_scores)
+    if filtered_chunks:
+        log_step(trace_id, "relevance_scored", {"top_similarity": top_similarity})
 
-        RELEVANCE_THRESHOLD = 0.35
-        if top_similarity < RELEVANCE_THRESHOLD:
+        if top_similarity is not None and top_similarity < MIN_SIMILARITY_THRESHOLD:
             answer_text = "I do not have enough information in the documents to answer confidently."
             failure_type = determine_failure_type(retrieved_chunks, 0.0, top_similarity, answer_text)
             trace.update({
                 "answer": answer_text,
                 "confidence": 0.0,
-                "confidence_reason": f"Top similarity score ({top_similarity:.2f}) below relevance threshold ({RELEVANCE_THRESHOLD})",
+                "confidence_reason": (
+                    f"Top similarity score ({top_similarity:.2f}) below relevance threshold "
+                    f"({MIN_SIMILARITY_THRESHOLD})"
+                ),
                 "groundedness_score": groundedness_score,
                 "failure_type": failure_type,
                 "latency_ms": 0.0,
                 "token_usage": 0,
                 "evaluation": {
                     "top_similarity": top_similarity,
-                    "relevance_threshold": RELEVANCE_THRESHOLD,
+                    "relevance_threshold": MIN_SIMILARITY_THRESHOLD,
                 },
             })
             save_trace(trace)
@@ -460,7 +456,10 @@ def ask(question: Question, top_k: int = TOP_K):
                 answer=answer_text,
                 sources=[m.get("source_file", "unknown") for m in filtered_metas],
                 confidence=0.0,
-                confidence_reason=f"Top similarity score ({top_similarity:.2f}) below relevance threshold ({RELEVANCE_THRESHOLD})",
+                confidence_reason=(
+                    f"Top similarity score ({top_similarity:.2f}) below relevance threshold "
+                    f"({MIN_SIMILARITY_THRESHOLD})"
+                ),
                 retrieved_chunks=filtered_chunks,
                 trace_id=trace_id,
             )
@@ -469,8 +468,8 @@ def ask(question: Question, top_k: int = TOP_K):
 
     confidence, confidence_reason = compute_retrieval_confidence(
         num_docs=len(filtered_docs),
-        distances=filtered_distances,
-        metadatas=filtered_metas
+        similarity_scores=filtered_similarity_scores,
+        metadatas=filtered_metas,
     )
     log_step(trace_id, "confidence_computed", {
         "confidence": confidence,

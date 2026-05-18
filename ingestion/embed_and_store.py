@@ -44,9 +44,10 @@ def embed_and_store_chunks(collection_name: str = "enterprise_docs"):
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
     print(f"✓ Initialized persistent Chroma client")
     
+    # Cosine space: Chroma returns distance where similarity = 1 - distance
     collection = chroma_client.get_or_create_collection(
         name=collection_name,
-        metadata={"hnsw:space": "cosine"}
+        metadata={"hnsw:space": "cosine"},
     )
     print(f"✓ Using collection: '{collection_name}'")
     

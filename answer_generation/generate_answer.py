@@ -10,13 +10,12 @@ import openai
 from retrieval.retrieve_chunks import retrieve_similar_chunks
 
 
-def generate_answer_with_citations(query: str, top_k: int = 4):
+def generate_answer_with_citations(query: str):
     """
     Generate an answer from retrieved chunks with citations.
 
     Args:
         query: The user's question
-        top_k: Number of chunks to retrieve and use for context
 
     Returns:
         Formatted answer with citations
@@ -27,7 +26,7 @@ def generate_answer_with_citations(query: str, top_k: int = 4):
     print("STEP 1: RETRIEVE RELEVANT CHUNKS")
     print("=" * 80)
 
-    retrieved_results = retrieve_similar_chunks(query, top_k=top_k)
+    retrieved_results = retrieve_similar_chunks(query)
 
     if not retrieved_results:
         return "Error: Could not retrieve any chunks from the knowledge base."
@@ -45,7 +44,7 @@ def generate_answer_with_citations(query: str, top_k: int = 4):
         chunk_text = f"""
 Section: {result['section_title']}
 Source: {result['source_file']}
-Content: {result['text_preview']}
+Content: {result['text']}
 """
         context_parts.append(chunk_text)
 
@@ -126,7 +125,7 @@ if __name__ == "__main__":
     print(f"Query: {test_query}")
     print("\n" + "=" * 100)
 
-    answer = generate_answer_with_citations(test_query, top_k=4)
+    answer = generate_answer_with_citations(test_query)
 
     print("\n" + "=" * 100)
     print("FINAL ANSWER:")
