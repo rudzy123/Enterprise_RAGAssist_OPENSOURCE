@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyze evaluation JSON results and surface the worst-performing cases.
+Analyze evaluation or sweep JSON results.
 """
 
 import argparse
@@ -13,52 +13,86 @@ def load_results(path: Path):
         return json.load(f)
 
 
-def summarize_results(results):
-    worst_groundedness = sorted(results, key=lambda x: x["metrics"].get("groundedness_score", 100.0))[:10]
-    worst_recall = sorted(results, key=lambda x: x["metrics"].get("retrieval_recall", 1.0))[:10]
-    hallucinations = [r for r in results if r["metrics"].get("failure_type") == "hallucination"]
+def summarize_single_run(results: list) -> dict:
+    metrics_list = [r["metrics"] for r in results]
+    total = len(metrics_list)
+    if total == 0:
+        return {}
 
-    summary = {
-        "total_cases": len(results),
-        "worst_groundedness": [
+    def avg(key: str) -> float:
+        return sum(m[key] for m in metrics_list) / total
+
+    worst_mrr = sorted(results, key=lambda r: r["metrics"].get("reciprocal_rank", 0.0))[:10]
+    abstentions = [r for r in results if r["metrics"].get("abstained")]
+
+    return {
+        "total_cases": total,
+        "precision_at_k": avg("precision_at_k"),
+        "mrr": sum(m["reciprocal_rank"] for m in metrics_list) / total,
+        "abstention_rate": sum(1 for m in metrics_list if m["abstained"]) / total,
+        "hit_rate": avg("retrieval_hit"),
+        "worst_mrr": [
             {
                 "question": r["question"],
-                "groundedness_score": r["metrics"].get("groundedness_score"),
-                "failure_type": r["metrics"].get("failure_type"),
-                "retrieved_sources": r["response"].get("sources"),
+                "reciprocal_rank": r["metrics"].get("reciprocal_rank"),
+                "returned_sources": r["metrics"].get("returned_sources"),
+                "abstained": r["metrics"].get("abstained"),
             }
-            for r in worst_groundedness
+            for r in worst_mrr
         ],
-        "worst_recall": [
+        "abstention_examples": [
             {
                 "question": r["question"],
-                "retrieval_recall": r["metrics"].get("retrieval_recall"),
-                "failure_type": r["metrics"].get("failure_type"),
-                "retrieved_sources": r["response"].get("sources"),
+                "expected_source": r.get("expected_source"),
             }
-            for r in worst_recall
-        ],
-        "hallucination_count": len(hallucinations),
-        "hallucination_examples": [
-            {
-                "question": r["question"],
-                "groundedness_score": r["metrics"].get("groundedness_score"),
-                "retrieval_recall": r["metrics"].get("retrieval_recall"),
-                "retrieved_sources": r["response"].get("sources"),
-            }
-            for r in hallucinations[:10]
+            for r in abstentions[:10]
         ],
     }
-    return summary
+
+
+def summarize_sweep(payload: dict) -> dict:
+    runs = payload.get("runs", [])
+    ranked = sorted(
+        runs,
+        key=lambda r: (
+            r["summary"]["mrr"],
+            r["summary"]["precision_at_k"],
+            -r["summary"]["abstention_rate"],
+        ),
+        reverse=True,
+    )
+    return {
+        "sweep": True,
+        "num_configs": len(runs),
+        "best_config": payload.get("best_config"),
+        "best_summary": payload.get("best_summary"),
+        "top_configs": [
+            {
+                "config": r["summary"]["config"],
+                "mrr": r["summary"]["mrr"],
+                "precision_at_k": r["summary"]["precision_at_k"],
+                "abstention_rate": r["summary"]["abstention_rate"],
+                "hit_at_k": r["summary"]["hit_at_k"],
+            }
+            for r in ranked[:5]
+        ],
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze eval JSON results")
-    parser.add_argument("result_file", type=Path, help="Path to evals/results_*.json")
+    parser.add_argument("result_file", type=Path, help="Path to evals/results*.json")
     args = parser.parse_args()
 
-    results = load_results(args.result_file)
-    summary = summarize_results(results)
+    payload = load_results(args.result_file)
+
+    if payload.get("sweep"):
+        summary = summarize_sweep(payload)
+    elif "results" in payload:
+        summary = summarize_single_run(payload["results"])
+    else:
+        summary = summarize_single_run(payload)
+
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 

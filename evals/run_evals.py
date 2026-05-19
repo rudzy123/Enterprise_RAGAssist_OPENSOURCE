@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-
-import sys
-from pathlib import Path
-
-# ✅ Ensure project root is importable
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+"""
+Run retrieval evaluations with precision@k, MRR, abstention rate, and optional sweeps.
+"""
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from retrieval.retrieve_chunks import retrieve_similar_chunks
+from evals.metrics import aggregate_metrics, compute_retrieval_metrics
 
 RESULTS_DIR = Path("evals")
 RESULTS_DIR.mkdir(exist_ok=True)
+
+DEFAULT_FINAL_K_VALUES = [2, 3, 4, 5]
+DEFAULT_MIN_SIMILARITY_VALUES = [0.35, 0.40, 0.45, 0.50, 0.55]
 
 
 def load_questions(jsonl_path: str) -> list:
@@ -27,148 +32,270 @@ def load_questions(jsonl_path: str) -> list:
     return questions
 
 
-def call_retrieval_directly(question: str) -> dict:
-    start_time = time.time()
+def evaluate_question(
+    question_obj: dict,
+    *,
+    final_k: int,
+    min_similarity: float,
+    retrieve_k: int,
+    rerank_enabled: bool,
+    verbose: bool,
+) -> dict:
+    question_text = question_obj.get("question", "")
+    start = time.time()
 
-    chunks = retrieve_similar_chunks(question)
+    trace = retrieve_similar_chunks(
+        question_text,
+        retrieve_k=retrieve_k,
+        final_k=final_k,
+        min_similarity=min_similarity,
+        rerank_enabled=rerank_enabled,
+        return_trace=True,
+        structured_logs=False,
+    )
 
-    latency_ms = (time.time() - start_time) * 1000
+    latency_ms = (time.time() - start) * 1000
+    final_chunks = trace["chunks"]
+    ranked_chunks = trace.get("reranked") or trace.get("threshold_passed") or final_chunks
+    abstained = len(final_chunks) == 0
 
-    print(f"  DEBUG: Retrieved {len(chunks)} chunks")
+    metrics = compute_retrieval_metrics(
+        question_obj,
+        final_chunks=final_chunks,
+        ranked_chunks=ranked_chunks,
+        k=final_k,
+        abstained=abstained,
+        latency_ms=latency_ms,
+    )
 
-    sources = list(set(
-        c.get("source_file")
-        for c in chunks
-        if c.get("source_file")
-    ))
+    if verbose:
+        print(f"\nQuestion: {question_text}")
+        print(f"Expected: {question_obj.get('source_doc_id')}")
+        print(f"Returned: {metrics['returned_sources']} (chunks={metrics['num_retrieved_chunks']})")
+        print(f"Hit@k: {'✓' if metrics['hit_at_k'] else '✗'}  P@{final_k}: {metrics['precision_at_k']:.2f}  RR: {metrics['reciprocal_rank']:.2f}")
+        if metrics["abstained"]:
+            print("  Abstained (no chunks returned)")
 
     return {
-        "retrieved_chunks": chunks,
-        "sources": sources,
-        "latency_ms": latency_ms
+        "question": question_text,
+        "expected_source": question_obj.get("source_doc_id"),
+        "metrics": metrics,
+        "config": {
+            "final_k": final_k,
+            "min_chunk_similarity": min_similarity,
+            "retrieve_k": retrieve_k,
+            "rerank_enabled": rerank_enabled,
+        },
     }
 
 
-def compute_metrics(question_obj: dict, response: dict) -> dict:
-    expected_sources = question_obj.get("source_doc_id") or []
+def run_single_config(
+    questions: list,
+    *,
+    final_k: int,
+    min_similarity: float,
+    retrieve_k: int,
+    rerank_enabled: bool,
+    verbose: bool,
+) -> dict:
+    results = [
+        evaluate_question(
+            q,
+            final_k=final_k,
+            min_similarity=min_similarity,
+            retrieve_k=retrieve_k,
+            rerank_enabled=rerank_enabled,
+            verbose=verbose,
+        )
+        for q in questions
+    ]
+    summary = aggregate_metrics([r["metrics"] for r in results])
+    summary["config"] = {
+        "final_k": final_k,
+        "min_chunk_similarity": min_similarity,
+        "retrieve_k": retrieve_k,
+        "rerank_enabled": rerank_enabled,
+    }
+    return {"summary": summary, "results": results}
 
-    if isinstance(expected_sources, str):
-        expected_sources = [expected_sources]
 
-    returned_sources = set(response.get("sources", []))
-    retrieved_chunks = response.get("retrieved_chunks", [])
+def print_summary(summary: dict) -> None:
+    print(f"Total: {summary['total_questions']}")
+    print(f"Hit rate:        {summary['hit_rate']:.3f}")
+    print(f"Hit@k:           {summary['hit_at_k']:.3f}")
+    print(f"Precision@k:     {summary['precision_at_k']:.3f}")
+    print(f"Avg precision:   {summary['avg_precision']:.3f}")
+    print(f"Recall@k:        {summary['recall_at_k']:.3f}")
+    print(f"Avg recall:      {summary['avg_recall']:.3f}")
+    print(f"MRR:             {summary['mrr']:.3f}")
+    print(f"Abstention rate: {summary['abstention_rate']:.3f}")
+    print(f"Avg latency ms:  {summary['avg_latency_ms']:.1f}")
 
-    expected_set = set(expected_sources)
 
-    relevant_retrieved = expected_set & returned_sources
+def run_parameter_sweep(
+    questions: list,
+    *,
+    final_k_values: list[int],
+    min_similarity_values: list[float],
+    retrieve_k: int,
+    rerank_enabled: bool,
+    verbose: bool,
+) -> dict:
+    sweep_runs = []
+    total = len(final_k_values) * len(min_similarity_values)
+    run_idx = 0
 
-    retrieval_hit = bool(relevant_retrieved) if expected_set else True
+    for final_k in final_k_values:
+        for min_similarity in min_similarity_values:
+            run_idx += 1
+            print(f"\n{'=' * 80}")
+            print(f"SWEEP {run_idx}/{total}: final_k={final_k}, min_similarity={min_similarity}")
+            print("=" * 80)
 
-    retrieval_precision = (
-        len(relevant_retrieved) / len(returned_sources)
-        if returned_sources else 1.0
-    )
+            run = run_single_config(
+                questions,
+                final_k=final_k,
+                min_similarity=min_similarity,
+                retrieve_k=retrieve_k,
+                rerank_enabled=rerank_enabled,
+                verbose=verbose,
+            )
+            print_summary(run["summary"])
+            sweep_runs.append(run)
 
-    retrieval_recall = (
-        len(relevant_retrieved) / len(expected_set)
-        if expected_set else 1.0
+    best = max(
+        sweep_runs,
+        key=lambda r: (
+            r["summary"]["mrr"],
+            r["summary"]["precision_at_k"],
+            -r["summary"]["abstention_rate"],
+        ),
     )
 
     return {
-        "retrieval_hit": retrieval_hit,
-        "retrieval_precision": retrieval_precision,
-        "retrieval_recall": retrieval_recall,
-        "missing_critical": list(expected_set - returned_sources),
-        "irrelevant_chunks": list(returned_sources - expected_set),
-        "returned_sources": list(returned_sources),
-        "num_retrieved_chunks": len(retrieved_chunks),
-        "latency_ms": response.get("latency_ms", 0.0),
+        "sweep": True,
+        "final_k_values": final_k_values,
+        "min_similarity_values": min_similarity_values,
+        "runs": [
+            {"summary": r["summary"], "num_results": len(r["results"])} for r in sweep_runs
+        ],
+        "best_config": best["summary"]["config"],
+        "best_summary": best["summary"],
     }
 
 
-def run_evals(jsonl_path: str):
+def save_results(payload: dict, prefix: str = "results") -> tuple[Path, Path]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp_path = RESULTS_DIR / f"{prefix}_{timestamp}.json"
+    latest_path = RESULTS_DIR / f"{prefix}.json"
+
+    for path in (timestamp_path, latest_path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    return timestamp_path, latest_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run retrieval evaluations")
+    parser.add_argument(
+        "jsonl_path",
+        nargs="?",
+        default="evals/questions.jsonl",
+        help="Path to questions JSONL file",
+    )
+    parser.add_argument("--sweep", action="store_true", help="Sweep final_k and min similarity")
+    parser.add_argument("--final-k", type=int, default=None, help="Final k (overrides config)")
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=None,
+        help="Minimum chunk similarity threshold",
+    )
+    parser.add_argument("--retrieve-k", type=int, default=15, help="Bi-encoder retrieve_k")
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable cross-encoder reranking during eval",
+    )
+    parser.add_argument(
+        "--final-k-values",
+        type=str,
+        default=",".join(str(v) for v in DEFAULT_FINAL_K_VALUES),
+        help="Comma-separated final_k values for sweep",
+    )
+    parser.add_argument(
+        "--min-similarity-values",
+        type=str,
+        default=",".join(str(v) for v in DEFAULT_MIN_SIMILARITY_VALUES),
+        help="Comma-separated min similarity values for sweep",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Per-question output")
+    args = parser.parse_args()
+
     try:
-        questions = load_questions(jsonl_path)
+        questions = load_questions(args.jsonl_path)
     except FileNotFoundError:
-        print(f"Error: Could not find {jsonl_path}")
+        print(f"Error: Could not find {args.jsonl_path}")
         sys.exit(1)
 
     if not questions:
         print("No questions loaded.")
         sys.exit(1)
 
-    print(f"Loaded {len(questions)} questions\n")
-    print("=" * 80)
+    print(f"Loaded {len(questions)} questions")
 
-    results = []
+    rerank_enabled = not args.no_rerank
 
-    for q in questions:
-        question_text = q.get("question", "")
+    if args.sweep:
+        final_k_values = [int(x.strip()) for x in args.final_k_values.split(",") if x.strip()]
+        min_similarity_values = [
+            float(x.strip()) for x in args.min_similarity_values.split(",") if x.strip()
+        ]
+        payload = run_parameter_sweep(
+            questions,
+            final_k_values=final_k_values,
+            min_similarity_values=min_similarity_values,
+            retrieve_k=args.retrieve_k,
+            rerank_enabled=rerank_enabled,
+            verbose=args.verbose,
+        )
+        print("\n" + "=" * 80)
+        print("BEST CONFIG")
+        print("=" * 80)
+        print(json.dumps(payload["best_config"], indent=2))
+        print_summary(payload["best_summary"])
+        ts_path, latest_path = save_results(payload, prefix="sweep_results")
+    else:
+        from config import FINAL_K, MIN_CHUNK_SIMILARITY
 
-        print(f"\nQuestion: {question_text}")
-        print(f"Expected sources: {q.get('source_doc_id')}")
+        final_k = args.final_k if args.final_k is not None else FINAL_K
+        min_similarity = (
+            args.min_similarity if args.min_similarity is not None else MIN_CHUNK_SIMILARITY
+        )
 
-        response = call_retrieval_directly(question_text)
-        metrics = compute_metrics(q, response)
+        print(f"\nConfig: final_k={final_k}, min_similarity={min_similarity}, rerank={rerank_enabled}")
+        print("=" * 80)
 
-        print(f"Sources: {metrics['returned_sources']}")
-        print(f"Chunks: {metrics['num_retrieved_chunks']}")
-        print(f"Hit: {'✓' if metrics['retrieval_hit'] else '✗'}")
-        print(f"Precision: {metrics['retrieval_precision']:.2f}")
-        print(f"Recall: {metrics['retrieval_recall']:.2f}")
+        payload = run_single_config(
+            questions,
+            final_k=final_k,
+            min_similarity=min_similarity,
+            retrieve_k=args.retrieve_k,
+            rerank_enabled=rerank_enabled,
+            verbose=args.verbose,
+        )
 
-        if metrics["missing_critical"]:
-            print(f"Missing: {metrics['missing_critical']}")
-
-        if metrics["irrelevant_chunks"]:
-            print(f"Irrelevant: {metrics['irrelevant_chunks']}")
-
-        results.append({
-            "question": question_text,
-            "metrics": metrics
-        })
-
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-
-    if not results:
-        print("No results generated.")
-        return
-
-    total = len(results)
-
-    hit_rate = sum(r["metrics"]["retrieval_hit"] for r in results) / total
-    avg_precision = sum(r["metrics"]["retrieval_precision"] for r in results) / total
-    avg_recall = sum(r["metrics"]["retrieval_recall"] for r in results) / total
-
-    print(f"Total: {total}")
-    print(f"Hit Rate: {hit_rate:.2f}")
-    print(f"Avg Precision: {avg_precision:.2f}")
-    print(f"Avg Recall: {avg_recall:.2f}")
-
-    timestamp = datetime.now().strftime("%Y%m%d")
-    timestamp_path = RESULTS_DIR / f"results_{timestamp}.json"
-    latest_path = RESULTS_DIR / "results.json"
-
-    with open(timestamp_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print_summary(payload["summary"])
+        ts_path, latest_path = save_results(payload)
 
     print(f"\n✅ Results saved to:")
-    print(f"- {timestamp_path}")
+    print(f"- {ts_path}")
     print(f"- {latest_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "jsonl_path",
-        nargs="?",
-        default="evals/questions.jsonl"
-    )
-    args = parser.parse_args()
-
-    run_evals(args.jsonl_path)
+    main()

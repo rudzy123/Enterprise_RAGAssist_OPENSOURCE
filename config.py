@@ -30,6 +30,8 @@ CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "50"))
 
 # Generation
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.3"))
+NOT_FOUND_ANSWER = os.getenv("NOT_FOUND_ANSWER", "Not found")
 
 # Observability
 TRACES_DIR = BASE_DIR / "traces"

@@ -47,11 +47,13 @@ ingestion → embedding → vector DB → retrieval → rerank → evaluation
 
 Retrieval quality is the core measure in this system. The evaluation framework computes:
 
-- **retrieval_hit**: Whether an expected source appears in returned results
-- **retrieval_precision**: Fraction of returned sources that are relevant
-- **retrieval_recall**: Fraction of expected sources that were retrieved
-- **missing_critical**: Expected documents not returned by retrieval
-- **irrelevant_chunks**: Retrieved sources not aligned with expected targets
+- **precision@k**: Relevant chunks in the top-k slots / k
+- **recall@k**: Expected documents found within the top-k chunks
+- **MRR** (mean reciprocal rank): Average of 1/rank for the first relevant chunk
+- **abstention_rate**: Fraction of queries where retrieval returns no chunks (below similarity threshold)
+- **retrieval_hit / precision / recall**: File-level source overlap metrics (legacy summary)
+
+Run a parameter sweep over `final_k` and `min_chunk_similarity` with `--sweep` to find the best retrieval config.
 
 These metrics enable targeted improvements and expose retrieval tradeoffs clearly.
 
@@ -107,7 +109,14 @@ python retrieval/retrieve_chunks.py
 ### Run evaluation
 
 ```bash
-python -m evals.run_evals
+# Single config (precision@k, MRR, abstention rate)
+PYTHONPATH=. python -m evals.run_evals
+
+# Sweep final_k and min similarity
+PYTHONPATH=. python -m evals.run_evals --sweep
+
+# Custom sweep grid
+PYTHONPATH=. python -m evals.run_evals --sweep --final-k-values 2,3,5 --min-similarity-values 0.35,0.40,0.45
 ```
 
 ### Run API server
