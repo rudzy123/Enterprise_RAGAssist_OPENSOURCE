@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Run retrieval evaluations with precision@k, MRR, abstention rate, and optional sweeps.
+Run end-to-end RAG evaluations over all questions in a JSONL file.
+
+Captures retrieval metrics plus answer quality (citations, groundedness),
+saves timestamped JSON results, and prints summary metrics.
 """
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -12,8 +16,9 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+from answer_generation.generation import generate_answer_from_chunks
+from evals.metrics import aggregate_metrics, compute_answer_metrics, compute_retrieval_metrics
 from retrieval.retrieve_chunks import retrieve_similar_chunks
-from evals.metrics import aggregate_metrics, compute_retrieval_metrics
 
 RESULTS_DIR = Path("evals")
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -39,6 +44,7 @@ def evaluate_question(
     min_similarity: float,
     retrieve_k: int,
     rerank_enabled: bool,
+    use_llm: bool,
     verbose: bool,
 ) -> dict:
     question_text = question_obj.get("question", "")
@@ -54,27 +60,50 @@ def evaluate_question(
         structured_logs=False,
     )
 
-    latency_ms = (time.time() - start) * 1000
+    retrieval_latency_ms = (time.time() - start) * 1000
     final_chunks = trace["chunks"]
     ranked_chunks = trace.get("reranked") or trace.get("threshold_passed") or final_chunks
+    raw_candidate_count = len(trace.get("raw_candidates") or [])
     abstained = len(final_chunks) == 0
 
-    metrics = compute_retrieval_metrics(
+    answer, confidence, confidence_reason, _, _ = generate_answer_from_chunks(
+        question_text,
+        final_chunks,
+        use_llm=use_llm,
+        raw_candidate_count=raw_candidate_count,
+    )
+
+    retrieval_metrics = compute_retrieval_metrics(
         question_obj,
         final_chunks=final_chunks,
         ranked_chunks=ranked_chunks,
         k=final_k,
         abstained=abstained,
-        latency_ms=latency_ms,
+        latency_ms=retrieval_latency_ms,
     )
+    answer_metrics = compute_answer_metrics(
+        question_obj,
+        answer=answer,
+        chunks=final_chunks,
+        abstained=abstained,
+        confidence=confidence,
+        confidence_reason=confidence_reason,
+    )
+    metrics = {**retrieval_metrics, **answer_metrics}
 
     if verbose:
         print(f"\nQuestion: {question_text}")
         print(f"Expected: {question_obj.get('source_doc_id')}")
+        print(f"Answer: {answer[:120]}{'...' if len(answer) > 120 else ''}")
+        print(f"Citations: {'yes' if metrics['has_citations'] else 'no'}")
+        print(f"Grounded: {'yes' if metrics['grounded'] else 'no'} ({metrics['groundedness_reason']})")
         print(f"Returned: {metrics['returned_sources']} (chunks={metrics['num_retrieved_chunks']})")
-        print(f"Hit@k: {'✓' if metrics['hit_at_k'] else '✗'}  P@{final_k}: {metrics['precision_at_k']:.2f}  RR: {metrics['reciprocal_rank']:.2f}")
-        if metrics["abstained"]:
-            print("  Abstained (no chunks returned)")
+        print(
+            f"Hit@k: {'✓' if metrics['hit_at_k'] else '✗'}  "
+            f"P@{final_k}: {metrics['precision_at_k']:.2f}  "
+            f"RR: {metrics['reciprocal_rank']:.2f}  "
+            f"conf: {metrics['confidence']:.2f}"
+        )
 
     return {
         "question": question_text,
@@ -85,6 +114,7 @@ def evaluate_question(
             "min_chunk_similarity": min_similarity,
             "retrieve_k": retrieve_k,
             "rerank_enabled": rerank_enabled,
+            "use_llm": use_llm,
         },
     }
 
@@ -96,6 +126,7 @@ def run_single_config(
     min_similarity: float,
     retrieve_k: int,
     rerank_enabled: bool,
+    use_llm: bool,
     verbose: bool,
 ) -> dict:
     results = [
@@ -105,6 +136,7 @@ def run_single_config(
             min_similarity=min_similarity,
             retrieve_k=retrieve_k,
             rerank_enabled=rerank_enabled,
+            use_llm=use_llm,
             verbose=verbose,
         )
         for q in questions
@@ -115,21 +147,28 @@ def run_single_config(
         "min_chunk_similarity": min_similarity,
         "retrieve_k": retrieve_k,
         "rerank_enabled": rerank_enabled,
+        "use_llm": use_llm,
     }
-    return {"summary": summary, "results": results}
+    return {
+        "run_at": datetime.now().isoformat(),
+        "num_questions": len(questions),
+        "summary": summary,
+        "results": results,
+    }
 
 
 def print_summary(summary: dict) -> None:
-    print(f"Total: {summary['total_questions']}")
-    print(f"Hit rate:        {summary['hit_rate']:.3f}")
-    print(f"Hit@k:           {summary['hit_at_k']:.3f}")
-    print(f"Precision@k:     {summary['precision_at_k']:.3f}")
-    print(f"Avg precision:   {summary['avg_precision']:.3f}")
-    print(f"Recall@k:        {summary['recall_at_k']:.3f}")
-    print(f"Avg recall:      {summary['avg_recall']:.3f}")
-    print(f"MRR:             {summary['mrr']:.3f}")
-    print(f"Abstention rate: {summary['abstention_rate']:.3f}")
-    print(f"Avg latency ms:  {summary['avg_latency_ms']:.1f}")
+    print(f"Total questions:     {summary['total_questions']}")
+    print(f"% with citations:    {summary['pct_with_citations'] * 100:.1f}%")
+    print(f"% grounded:          {summary['pct_grounded'] * 100:.1f}%")
+    print(f"Avg groundedness:    {summary['avg_groundedness_score']:.3f}")
+    print(f"Avg confidence:      {summary['avg_confidence']:.3f}")
+    print(f"Hit rate:            {summary['hit_rate']:.3f}")
+    print(f"Hit@k:               {summary['hit_at_k']:.3f}")
+    print(f"Precision@k:         {summary['precision_at_k']:.3f}")
+    print(f"MRR:                 {summary['mrr']:.3f}")
+    print(f"Abstention rate:     {summary['abstention_rate']:.3f}")
+    print(f"Avg latency ms:      {summary['avg_latency_ms']:.1f}")
 
 
 def run_parameter_sweep(
@@ -139,6 +178,7 @@ def run_parameter_sweep(
     min_similarity_values: list[float],
     retrieve_k: int,
     rerank_enabled: bool,
+    use_llm: bool,
     verbose: bool,
 ) -> dict:
     sweep_runs = []
@@ -158,6 +198,7 @@ def run_parameter_sweep(
                 min_similarity=min_similarity,
                 retrieve_k=retrieve_k,
                 rerank_enabled=rerank_enabled,
+                use_llm=use_llm,
                 verbose=verbose,
             )
             print_summary(run["summary"])
@@ -166,6 +207,8 @@ def run_parameter_sweep(
     best = max(
         sweep_runs,
         key=lambda r: (
+            r["summary"]["pct_grounded"],
+            r["summary"]["pct_with_citations"],
             r["summary"]["mrr"],
             r["summary"]["precision_at_k"],
             -r["summary"]["abstention_rate"],
@@ -173,7 +216,9 @@ def run_parameter_sweep(
     )
 
     return {
+        "run_at": datetime.now().isoformat(),
         "sweep": True,
+        "num_questions": len(questions),
         "final_k_values": final_k_values,
         "min_similarity_values": min_similarity_values,
         "runs": [
@@ -197,7 +242,7 @@ def save_results(payload: dict, prefix: str = "results") -> tuple[Path, Path]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run retrieval evaluations")
+    parser = argparse.ArgumentParser(description="Run RAG evaluations over JSONL questions")
     parser.add_argument(
         "jsonl_path",
         nargs="?",
@@ -217,6 +262,11 @@ def main():
         "--no-rerank",
         action="store_true",
         help="Disable cross-encoder reranking during eval",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Use retrieval-only answer generation (no OpenAI)",
     )
     parser.add_argument(
         "--final-k-values",
@@ -243,9 +293,12 @@ def main():
         print("No questions loaded.")
         sys.exit(1)
 
-    print(f"Loaded {len(questions)} questions")
+    print(f"Loaded {len(questions)} questions from {args.jsonl_path}")
 
     rerank_enabled = not args.no_rerank
+    use_llm = not args.no_llm and bool(os.getenv("OPENAI_API_KEY"))
+    if not args.no_llm and not use_llm:
+        print("No OPENAI_API_KEY set — using retrieval-only answer generation.")
 
     if args.sweep:
         final_k_values = [int(x.strip()) for x in args.final_k_values.split(",") if x.strip()]
@@ -258,6 +311,7 @@ def main():
             min_similarity_values=min_similarity_values,
             retrieve_k=args.retrieve_k,
             rerank_enabled=rerank_enabled,
+            use_llm=use_llm,
             verbose=args.verbose,
         )
         print("\n" + "=" * 80)
@@ -274,7 +328,10 @@ def main():
             args.min_similarity if args.min_similarity is not None else MIN_CHUNK_SIMILARITY
         )
 
-        print(f"\nConfig: final_k={final_k}, min_similarity={min_similarity}, rerank={rerank_enabled}")
+        print(
+            f"\nConfig: final_k={final_k}, min_similarity={min_similarity}, "
+            f"rerank={rerank_enabled}, use_llm={use_llm}"
+        )
         print("=" * 80)
 
         payload = run_single_config(
@@ -283,6 +340,7 @@ def main():
             min_similarity=min_similarity,
             retrieve_k=args.retrieve_k,
             rerank_enabled=rerank_enabled,
+            use_llm=use_llm,
             verbose=args.verbose,
         )
 

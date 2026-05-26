@@ -10,24 +10,33 @@ import logging
 from typing import List, Optional
 
 from observability import log_event
-
-TEXT_PREVIEW_LEN = 120
+from retrieval.result_format import (
+    TEXT_PREVIEW_LEN,
+    format_document_source,
+    make_text_preview,
+)
 
 
 def chunk_log_entry(chunk: dict, rank: Optional[int] = None) -> dict:
     """Compact, JSON-serializable chunk summary for logs."""
-    text = chunk.get("text") or ""
+    source_file = chunk.get("source_file", "Unknown")
+    section_title = chunk.get("section_title", "Unknown")
     entry = {
         "chunk_id": chunk.get("chunk_id"),
-        "source_file": chunk.get("source_file"),
-        "section_title": chunk.get("section_title"),
+        "source_file": source_file,
+        "section_title": section_title,
+        "document_source": chunk.get("document_source")
+        or format_document_source(source_file, section_title),
         "similarity_score": _round_score(chunk.get("similarity_score")),
         "distance": _round_score(chunk.get("distance")),
         "rerank_score": _round_score(chunk.get("rerank_score")),
-        "text_preview": text[:TEXT_PREVIEW_LEN] + ("..." if len(text) > TEXT_PREVIEW_LEN else ""),
+        "text_preview": chunk.get("text_preview")
+        or make_text_preview(chunk.get("text") or ""),
     }
     if rank is not None:
         entry["rank"] = rank
+    elif chunk.get("rank") is not None:
+        entry["rank"] = chunk["rank"]
     return entry
 
 
@@ -128,6 +137,26 @@ def log_final_selection(
     )
 
 
+def log_retrieval_results(
+    logger: logging.Logger,
+    query: str,
+    final_chunks: List[dict],
+    *,
+    trace_id: Optional[str] = None,
+    top_k: Optional[int] = None,
+) -> None:
+    """Emit a consolidated structured log of the final retrieval output."""
+    log_event(
+        logger,
+        "retrieval_results",
+        trace_id=trace_id,
+        query=query,
+        top_k=top_k,
+        count=len(final_chunks),
+        results=[chunk_log_entry(c) for c in final_chunks],
+    )
+
+
 def log_retrieval_pipeline(
     logger: logging.Logger,
     query: str,
@@ -175,4 +204,11 @@ def log_retrieval_pipeline(
         trace_id=trace_id,
         final_k=final_k,
         max_chunks_per_file=max_chunks_per_file,
+    )
+    log_retrieval_results(
+        logger,
+        query,
+        final_chunks,
+        trace_id=trace_id,
+        top_k=final_k,
     )

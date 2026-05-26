@@ -84,6 +84,7 @@ def test_log_retrieval_pipeline_emits_four_events():
         "retrieval_similarity_scores",
         "retrieval_rerank_scores",
         "retrieval_final_selection",
+        "retrieval_results",
     ]
     assert mock_log.call_args_list[0].kwargs["trace_id"] == "trace-123"
     assert mock_log.call_args_list[1].kwargs["passed_count"] == 1

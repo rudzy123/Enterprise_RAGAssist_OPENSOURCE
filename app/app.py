@@ -70,18 +70,20 @@ def main():
                     return
 
                 st.header("📄 Retrieved Information")
-                for i, result in enumerate(retrieved_results, 1):
+                for result in retrieved_results:
                     score_hint = (
                         f"rerank {result['rerank_score']:.3f}"
                         if "rerank_score" in result
                         else f"sim {result['similarity_score']:.3f}"
                     )
-                    with st.expander(f"📋 Result {i}: {result['section_title']} ({score_hint})"):
-                        st.markdown(f"**Source:** {result['source_file']}")
-                        st.markdown(f"**Section:** {result['section_title']}")
+                    with st.expander(
+                        f"📋 Result {result['rank']}: {result['document_source']} ({score_hint})"
+                    ):
+                        st.markdown(f"**Source:** {result['document_source']}")
                         st.markdown(f"**Bi-encoder similarity:** {result['similarity_score']:.4f}")
                         if "rerank_score" in result:
                             st.markdown(f"**Rerank score:** {result['rerank_score']:.4f}")
+                        st.markdown(f"**Preview:** {result['text_preview']}")
                         st.text_area(
                             "Content:",
                             result["text"],
@@ -91,7 +93,7 @@ def main():
 
                 st.header("🤖 Generated Answer")
                 with st.spinner("Generating answer..."):
-                    answer, confidence, confidence_reason = generate_answer_from_chunks(
+                    answer, confidence, confidence_reason, _, _ = generate_answer_from_chunks(
                         question,
                         retrieved_results,
                         api_key=api_key or None,

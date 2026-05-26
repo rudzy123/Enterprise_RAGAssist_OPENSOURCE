@@ -1,10 +1,40 @@
 """
-Retrieval evaluation metrics: precision@k, MRR, recall, and abstention.
+Retrieval and answer evaluation metrics: precision@k, MRR, citations, groundedness.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Sequence, Set
+
+from config import NOT_FOUND_ANSWER
+
+GROUNDEDNESS_THRESHOLD = 0.4
+_CITATION_PATTERN = re.compile(r"\[[^\]]+\]")
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "to",
+        "of",
+        "and",
+        "or",
+        "in",
+        "for",
+        "on",
+        "with",
+        "be",
+        "this",
+        "that",
+        "must",
+        "may",
+        "not",
+        "found",
+    }
+)
 
 
 def normalize_expected_sources(question_obj: dict) -> List[str]:
@@ -142,6 +172,9 @@ def aggregate_metrics(per_question_metrics: Sequence[dict]) -> dict:
     def avg(key: str) -> float:
         return sum(m[key] for m in per_question_metrics) / total
 
+    with_citations = sum(1 for m in per_question_metrics if m.get("has_citations"))
+    grounded = sum(1 for m in per_question_metrics if m.get("grounded"))
+
     return {
         "total_questions": total,
         "hit_rate": avg("retrieval_hit"),
@@ -153,4 +186,114 @@ def aggregate_metrics(per_question_metrics: Sequence[dict]) -> dict:
         "mrr": mean_reciprocal_rank([m["reciprocal_rank"] for m in per_question_metrics]),
         "abstention_rate": sum(1 for m in per_question_metrics if m["abstained"]) / total,
         "avg_latency_ms": avg("latency_ms"),
+        "pct_with_citations": with_citations / total,
+        "pct_grounded": grounded / total,
+        "avg_groundedness_score": avg("groundedness_score"),
+        "avg_confidence": avg("confidence"),
+    }
+
+
+def _normalize_tokens(text: str) -> set[str]:
+    cleaned = _CITATION_PATTERN.sub("", text.lower())
+    tokens = re.findall(r"[a-z0-9]+", cleaned)
+    return {token for token in tokens if len(token) > 2 and token not in _STOPWORDS}
+
+
+def token_overlap_with_chunks(answer: str, chunks: Sequence[dict]) -> float:
+    """Fraction of answer tokens that also appear in retrieved chunk text."""
+    answer_tokens = _normalize_tokens(answer)
+    if not answer_tokens:
+        return 0.0
+
+    chunk_text = " ".join(chunk.get("text", "") for chunk in chunks)
+    chunk_tokens = _normalize_tokens(chunk_text)
+    if not chunk_tokens:
+        return 0.0
+
+    return len(answer_tokens & chunk_tokens) / len(answer_tokens)
+
+
+def _expected_supported_by_chunks(expected_answer: str, chunks: Sequence[dict]) -> bool:
+    expected_tokens = _normalize_tokens(expected_answer)
+    if not expected_tokens:
+        return False
+
+    chunk_text = " ".join(chunk.get("text", "") for chunk in chunks)
+    chunk_tokens = _normalize_tokens(chunk_text)
+    if not chunk_tokens:
+        return False
+
+    return len(expected_tokens & chunk_tokens) / len(expected_tokens) >= GROUNDEDNESS_THRESHOLD
+
+
+def answer_has_citations(answer: str, chunks: Sequence[dict]) -> bool:
+    """True when the answer includes at least one citation label from retrieved chunks."""
+    if not chunks:
+        return False
+
+    from answer_generation.generation import answer_has_chunk_citations
+
+    return answer_has_chunk_citations(answer, chunks)
+
+
+def compute_groundedness_heuristic(
+    answer: str,
+    chunks: Sequence[dict],
+    *,
+    expected_answer: str = "",
+    abstained: bool,
+) -> tuple[bool, float, str]:
+    """
+    Heuristic groundedness check for eval.
+
+    - Not found with no returned chunks: grounded abstention
+    - Not found with answerable context in chunks: ungrounded abstention
+    - Substantive answers: token overlap with retrieved chunk text
+    """
+    not_found = answer.strip().lower() == NOT_FOUND_ANSWER.lower()
+
+    if not_found:
+        if abstained or not chunks:
+            return True, 1.0, "correct abstention (no context returned)"
+        if expected_answer and _expected_supported_by_chunks(expected_answer, chunks):
+            return False, 0.0, "abstained despite answerable context"
+        return True, 0.85, "abstained with insufficient context"
+
+    if not chunks:
+        return False, 0.0, "answer produced without retrieved chunks"
+
+    overlap = token_overlap_with_chunks(answer, chunks)
+    grounded = overlap >= GROUNDEDNESS_THRESHOLD
+    reason = f"token overlap with retrieved chunks ({overlap:.2f})"
+    return grounded, round(overlap, 4), reason
+
+
+def compute_answer_metrics(
+    question_obj: dict,
+    *,
+    answer: str,
+    chunks: Sequence[dict],
+    abstained: bool,
+    confidence: float,
+    confidence_reason: str,
+) -> dict:
+    """Compute answer-level eval fields for one question."""
+    expected_answer = question_obj.get("expected_answer", "") or ""
+    has_citations = answer_has_citations(answer, chunks)
+    grounded, groundedness_score, groundedness_reason = compute_groundedness_heuristic(
+        answer,
+        chunks,
+        expected_answer=expected_answer,
+        abstained=abstained,
+    )
+
+    return {
+        "answer": answer,
+        "expected_answer": expected_answer,
+        "has_citations": has_citations,
+        "grounded": grounded,
+        "groundedness_score": groundedness_score,
+        "groundedness_reason": groundedness_reason,
+        "confidence": confidence,
+        "confidence_reason": confidence_reason,
     }

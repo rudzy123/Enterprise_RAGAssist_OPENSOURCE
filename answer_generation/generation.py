@@ -1,5 +1,8 @@
 """
 Answer generation with mandatory chunk citations and low-confidence abstention.
+
+All answers are grounded exclusively in retrieved chunks. Weak retrieval context
+returns a configured not-found response with a retrieval-quality confidence score.
 """
 
 from __future__ import annotations
@@ -10,13 +13,15 @@ from typing import List, Optional, Tuple
 import openai
 
 from config import NOT_FOUND_ANSWER, OPENAI_MODEL
-from answer_generation.confidence import compute_retrieval_confidence, is_low_confidence
-from retrieval.similarity import chunk_similarity_score
+from answer_generation.confidence import assess_retrieval_context
 
 
 def chunk_citation(chunk: dict) -> str:
     """Canonical inline citation label for a retrieved chunk."""
-    return f"[{chunk['source_file']} - {chunk.get('section_title', 'section')}]"
+    source = chunk.get("document_source")
+    if not source:
+        source = f"{chunk['source_file']} - {chunk.get('section_title', 'section')}"
+    return f"[{source}]"
 
 
 def format_chunks_for_prompt(chunks: List[dict]) -> Tuple[str, List[str]]:
@@ -50,8 +55,8 @@ Allowed citation labels:
 Question: {query}
 
 Rules:
-- Answer using only information from the retrieved chunks above.
-- Every factual statement MUST include an inline citation using an allowed label (e.g. [file.md - Section Name]).
+- Use ONLY information from the retrieved chunks above. Do not use outside knowledge.
+- Every sentence in your answer MUST include at least one inline citation using an allowed label.
 - Do not invent sources or cite labels that are not listed above.
 - If the chunks do not contain enough information to answer, respond with exactly: {NOT_FOUND_ANSWER}
 
@@ -72,54 +77,76 @@ def generate_retrieval_only_answer(question: str, chunks: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def ensure_cited_answer(answer: str, chunks: List[dict]) -> str:
+    """Ensure the answer includes chunk citations or fall back to cited snippets."""
+    if answer.strip().lower() == NOT_FOUND_ANSWER.lower():
+        return NOT_FOUND_ANSWER
+    if answer_has_chunk_citations(answer, chunks):
+        return answer
+    return generate_retrieval_only_answer("", chunks)
+
+
 def generate_with_openai(
     query: str,
     chunks: List[dict],
     *,
     api_key: Optional[str] = None,
-) -> Tuple[str, Optional[int]]:
+) -> Tuple[str, Optional[int], dict]:
     """
-    Generate an answer with mandatory citations.
+    Generate an answer with mandatory citations from retrieved chunks only.
 
     Returns:
-        (answer_text, total_tokens)
+        (answer_text, total_tokens, observability)
     """
     key = api_key or os.getenv("OPENAI_API_KEY")
     if not key:
-        return "Error: OPENAI_API_KEY environment variable not set.", None
+        answer = generate_retrieval_only_answer(query, chunks)
+        return answer, None, {
+            "llm_prompt": None,
+            "model_response": answer,
+            "generation_mode": "retrieval_only",
+        }
 
     context, citation_labels = format_chunks_for_prompt(chunks)
     prompt = build_generation_prompt(query, context, citation_labels)
+    system_message = (
+        "You answer only from provided retrieved chunks. "
+        "Do not use any outside knowledge. "
+        "Every sentence must include an inline citation. "
+        f"If unsure, respond with exactly: {NOT_FOUND_ANSWER}"
+    )
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": prompt},
+    ]
+    llm_prompt = {"model": OPENAI_MODEL, "messages": messages}
 
     client = openai.OpenAI(api_key=key)
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You answer only from provided retrieved chunks. "
-                    f"Every claim needs an inline citation. If unsure, say exactly: {NOT_FOUND_ANSWER}"
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        messages=messages,
         max_tokens=500,
-        temperature=0.1,
+        temperature=0.0,
     )
 
-    answer = response.choices[0].message.content.strip()
+    raw_response = response.choices[0].message.content.strip()
     total_tokens = None
     if getattr(response, "usage", None):
         total_tokens = getattr(response.usage, "total_tokens", None)
 
-    if answer.strip().lower() == NOT_FOUND_ANSWER.lower():
-        return NOT_FOUND_ANSWER, total_tokens
+    if raw_response.strip().lower() == NOT_FOUND_ANSWER.lower():
+        return NOT_FOUND_ANSWER, total_tokens, {
+            "llm_prompt": llm_prompt,
+            "model_response": raw_response,
+            "generation_mode": "llm",
+        }
 
-    if not answer_has_chunk_citations(answer, chunks):
-        return generate_retrieval_only_answer(query, chunks), total_tokens
-
-    return answer, total_tokens
+    final_answer = ensure_cited_answer(raw_response, chunks)
+    return final_answer, total_tokens, {
+        "llm_prompt": llm_prompt,
+        "model_response": raw_response,
+        "generation_mode": "llm",
+    }
 
 
 def generate_answer_from_chunks(
@@ -127,40 +154,37 @@ def generate_answer_from_chunks(
     chunks: List[dict],
     *,
     api_key: Optional[str] = None,
-    confidence: Optional[float] = None,
     use_llm: bool = True,
-) -> Tuple[str, float, str]:
+    raw_candidate_count: int = 0,
+) -> Tuple[str, float, str, Optional[int], dict]:
     """
-    Generate an answer from retrieved chunks with confidence gating.
+    Generate an answer from retrieved chunks with retrieval-quality confidence gating.
 
     Returns:
-        (answer_text, confidence, confidence_reason)
+        (answer_text, confidence, confidence_reason, token_usage, observability)
     """
-    metadatas = [
-        {"source_file": c["source_file"], "section_title": c.get("section_title")}
-        for c in chunks
-    ]
-    similarity_scores = [chunk_similarity_score(c) for c in chunks]
+    observability = {
+        "llm_prompt": None,
+        "model_response": None,
+        "generation_mode": "abstained",
+    }
+    confidence, confidence_reason, is_weak = assess_retrieval_context(
+        chunks,
+        raw_candidate_count=raw_candidate_count,
+    )
 
-    if confidence is None:
-        confidence, confidence_reason = compute_retrieval_confidence(
-            num_docs=len(chunks),
-            similarity_scores=similarity_scores,
-            metadatas=metadatas,
-        )
-    else:
-        _, confidence_reason = compute_retrieval_confidence(
-            num_docs=len(chunks),
-            similarity_scores=similarity_scores,
-            metadatas=metadatas,
-        )
-
-    if not chunks or is_low_confidence(confidence):
-        return NOT_FOUND_ANSWER, confidence, confidence_reason
+    if is_weak:
+        observability["model_response"] = NOT_FOUND_ANSWER
+        return NOT_FOUND_ANSWER, confidence, confidence_reason, None, observability
 
     if use_llm and (api_key or os.getenv("OPENAI_API_KEY")):
-        answer, _ = generate_with_openai(query, chunks, api_key=api_key)
+        answer, token_usage, llm_obs = generate_with_openai(query, chunks, api_key=api_key)
+        observability.update(llm_obs)
     else:
         answer = generate_retrieval_only_answer(query, chunks)
+        token_usage = None
+        observability["generation_mode"] = "retrieval_only"
+        observability["model_response"] = answer
 
-    return answer, confidence, confidence_reason
+    answer = ensure_cited_answer(answer, chunks)
+    return answer, confidence, confidence_reason, token_usage, observability

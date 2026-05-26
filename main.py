@@ -18,14 +18,11 @@ from config import (
     NOT_FOUND_ANSWER,
     RETRIEVE_K,
 )
-from answer_generation.confidence import compute_retrieval_confidence, is_low_confidence
-from answer_generation.generation import (
-    generate_retrieval_only_answer,
-    generate_with_openai,
-)
+from answer_generation.generation import generate_answer_from_chunks
 from retrieval.retrieve_chunks import retrieve_similar_chunks
 from retrieval.similarity import chunk_similarity_score, max_similarity
-from observability import TraceStore, build_step_log, log_event, setup_json_logger
+from observability import TraceStore, log_event, setup_json_logger
+from observability.request_log import RequestLogger
 
 # -------------------------------------------------
 # App
@@ -41,12 +38,26 @@ class Question(BaseModel):
     question: str
 
 
+class RetrievedChunk(BaseModel):
+    chunk_id: str
+    rank: int
+    source_file: str
+    section_title: str
+    document_source: str
+    similarity_score: float
+    distance: float
+    text: str
+    text_preview: str
+    rerank_score: Optional[float] = None
+
+
 class Answer(BaseModel):
     answer: str
     sources: List[str]
     confidence: float
     confidence_reason: Optional[str] = None
-    retrieved_chunks: Optional[List[dict]] = None
+    top_k: int
+    retrieved_chunks: Optional[List[RetrievedChunk]] = None
     trace_id: Optional[str] = None
 
 
@@ -65,6 +76,14 @@ collection = chroma_client.get_or_create_collection(
 # -------------------------------------------------
 # Helper Functions
 # -------------------------------------------------
+
+def _chunk_sources(chunks: List[dict]) -> List[str]:
+    return [c.get("document_source") or c["source_file"] for c in chunks]
+
+
+def _serialize_chunks(chunks: List[dict]) -> List[RetrievedChunk]:
+    return [RetrievedChunk(**chunk) for chunk in chunks]
+
 
 def embed(text: str):
     return embedding_model.encode(text).tolist()
@@ -100,9 +119,8 @@ def determine_failure_type(
 
 
 def log_step(trace_id: str, event: str, details: dict = None):
-    step = build_step_log(event, details)
-    log_event(logger, event, trace_id=trace_id, details=details or {})
-    return step
+    """Legacy helper; prefer RequestLogger for new code."""
+    log_event(logger, event, trace_id=trace_id, **(details or {}))
 
 
 def save_trace(trace: dict):
@@ -201,16 +219,12 @@ def ask(question: Question, final_k: int = FINAL_K):
     """
     trace_id = str(uuid.uuid4())
     started_at = datetime.utcnow()
-    step_logs = []
-    answer_text = ""
-    generated_tokens = None
-    groundedness_score = None
-    failure_type = "success"
+    request_log = RequestLogger(trace_id=trace_id, query=question.question)
+    request_log.bind_logger(logger)
+    request_log.log_query(question.question)
 
-    log_step(trace_id, "request_received", {"query": question.question})
-
-    step_logs.append(build_step_log("query_embedding_created", {"query_length": len(question.question)}))
-    log_step(trace_id, "retrieval_started", {"retrieve_k": RETRIEVE_K, "final_k": final_k})
+    retrieval_started = time.perf_counter()
+    request_log.add_step("retrieval_started", {"retrieve_k": RETRIEVE_K, "final_k": final_k})
 
     retrieval = retrieve_similar_chunks(
         question.question,
@@ -220,197 +234,90 @@ def ask(question: Question, final_k: int = FINAL_K):
         trace_id=trace_id,
     )
 
+    retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
     filtered_chunks = retrieval["chunks"]
-    retrieved_chunks = retrieval["threshold_passed"]
     raw_candidates = retrieval["raw_candidates"]
 
-    filtered_docs = [c["text"] for c in filtered_chunks]
-    filtered_metas = [
-        {"source_file": c["source_file"], "section_title": c["section_title"]}
-        for c in filtered_chunks
-    ]
     filtered_similarity_scores = [chunk_similarity_score(c) for c in filtered_chunks]
-
-    step_logs.append(build_step_log("retrieval_completed", {
-        "raw_candidate_count": len(raw_candidates),
-        "threshold_passed_count": len(retrieved_chunks),
-        "reranked_count": len(retrieval.get("reranked", [])),
-        "filtered_count": len(filtered_chunks),
-        "rerank_enabled": retrieval.get("rerank_enabled", False),
-        "top_similarity": max_similarity(
-            [chunk_similarity_score(c) for c in filtered_chunks]
-            or [chunk_similarity_score(c) for c in raw_candidates]
-        ),
-        "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
-        "max_chunks_per_file": retrieval["max_chunks_per_file"],
-    }))
-
-    trace = {
-        "trace_id": trace_id,
-        "query": question.question,
-        "retrieved_chunks": retrieved_chunks,
-        "filtered_chunks": filtered_chunks,
-        "created_at": started_at.isoformat() + "Z",
-        "step_logs": step_logs,
-    }
-
-    if not raw_candidates:
-        answer_text = NOT_FOUND_ANSWER
-        failure_type = determine_failure_type(retrieved_chunks, 0.0, None, answer_text)
-        trace.update({
-            "answer": answer_text,
-            "confidence": 0.0,
-            "confidence_reason": "No documents matched the query",
-            "groundedness_score": groundedness_score,
-            "failure_type": failure_type,
-            "latency_ms": 0.0,
-            "token_usage": 0,
-            "evaluation": {
-                "retrieval_reason": "No docs retrieved"
-            },
-        })
-        save_trace(trace)
-        if DEBUG_MODE:
-            print(json.dumps(trace, indent=2))
-        return Answer(
-            answer=answer_text,
-            sources=[],
-            confidence=0.0,
-            confidence_reason="No documents matched the query",
-            retrieved_chunks=retrieved_chunks,
-            trace_id=trace_id,
-        )
-
-    if not filtered_chunks:
-        answer_text = NOT_FOUND_ANSWER
-        failure_type = determine_failure_type(retrieved_chunks, 0.0, None, answer_text)
-        trace.update({
-            "answer": answer_text,
-            "confidence": 0.0,
-            "confidence_reason": f"No retrieved chunks met similarity threshold ({MIN_CHUNK_SIMILARITY})",
-            "groundedness_score": groundedness_score,
-            "failure_type": failure_type,
-            "latency_ms": 0.0,
-            "token_usage": 0,
-            "evaluation": {
-                "filtered_count": len(filtered_chunks),
-                "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
-            },
-        })
-        save_trace(trace)
-        if DEBUG_MODE:
-            print(json.dumps(trace, indent=2))
-        return Answer(
-            answer=answer_text,
-            sources=[chunk["source_file"] for chunk in filtered_chunks],
-            confidence=0.0,
-            confidence_reason=f"No retrieved chunks met similarity threshold ({MIN_CHUNK_SIMILARITY})",
-            retrieved_chunks=filtered_chunks,
-            trace_id=trace_id,
-        )
-
-    top_similarity = max_similarity(filtered_similarity_scores)
-    if filtered_chunks:
-        log_step(trace_id, "relevance_scored", {"top_similarity": top_similarity})
-
-        if top_similarity is not None and top_similarity < MIN_SIMILARITY_THRESHOLD:
-            answer_text = NOT_FOUND_ANSWER
-            failure_type = determine_failure_type(retrieved_chunks, 0.0, top_similarity, answer_text)
-            trace.update({
-                "answer": answer_text,
-                "confidence": 0.0,
-                "confidence_reason": (
-                    f"Top similarity score ({top_similarity:.2f}) below relevance threshold "
-                    f"({MIN_SIMILARITY_THRESHOLD})"
-                ),
-                "groundedness_score": groundedness_score,
-                "failure_type": failure_type,
-                "latency_ms": 0.0,
-                "token_usage": 0,
-                "evaluation": {
-                    "top_similarity": top_similarity,
-                    "relevance_threshold": MIN_SIMILARITY_THRESHOLD,
-                },
-            })
-            save_trace(trace)
-            if DEBUG_MODE:
-                print(json.dumps(trace, indent=2))
-            return Answer(
-                answer=answer_text,
-                sources=[m.get("source_file", "unknown") for m in filtered_metas],
-                confidence=0.0,
-                confidence_reason=(
-                    f"Top similarity score ({top_similarity:.2f}) below relevance threshold "
-                    f"({MIN_SIMILARITY_THRESHOLD})"
-                ),
-                retrieved_chunks=filtered_chunks,
-                trace_id=trace_id,
-            )
-    else:
-        log_step(trace_id, "relevance_scored", {"top_similarity": None})
-
-    confidence, confidence_reason = compute_retrieval_confidence(
-        num_docs=len(filtered_docs),
-        similarity_scores=filtered_similarity_scores,
-        metadatas=filtered_metas,
+    top_similarity = max_similarity(
+        filtered_similarity_scores
+        or [chunk_similarity_score(c) for c in raw_candidates]
     )
-    log_step(trace_id, "confidence_computed", {
-        "confidence": confidence,
-        "confidence_reason": confidence_reason,
-        "filtered_doc_count": len(filtered_docs),
-    })
 
-    if is_low_confidence(confidence):
-        answer_text = NOT_FOUND_ANSWER
-        failure_type = determine_failure_type(retrieved_chunks, confidence, top_similarity, answer_text)
-        trace.update({
-            "answer": answer_text,
-            "confidence": confidence,
-            "confidence_reason": confidence_reason,
-            "groundedness_score": groundedness_score,
-            "failure_type": failure_type,
-            "latency_ms": 0.0,
-            "token_usage": 0,
-            "evaluation": {
-                "confidence_threshold": 0.3,
-                "confidence_reason": confidence_reason,
-            },
-        })
-        save_trace(trace)
-        if DEBUG_MODE:
-            print(json.dumps(trace, indent=2))
-        return Answer(
-            answer=answer_text,
-            sources=[m.get("source_file", "unknown") for m in filtered_metas],
-            confidence=confidence,
-            confidence_reason=confidence_reason,
-            retrieved_chunks=filtered_chunks,
-            trace_id=trace_id,
-        )
+    request_log.log_retrieved_chunks(filtered_chunks)
+    request_log.add_step(
+        "retrieval_completed",
+        {
+            "raw_candidate_count": len(raw_candidates),
+            "filtered_count": len(filtered_chunks),
+            "rerank_enabled": retrieval.get("rerank_enabled", False),
+            "top_similarity": top_similarity,
+            "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
+            "max_chunks_per_file": retrieval["max_chunks_per_file"],
+        },
+    )
+    request_log.add_step("relevance_scored", {"top_similarity": top_similarity})
 
-    log_step(trace_id, "generation_started", {"source_count": len(filtered_chunks)})
-    if not os.getenv("OPENAI_API_KEY"):
-        answer_text = generate_retrieval_only_answer(question.question, filtered_chunks)
-        generated_tokens = estimate_token_usage(question.question, answer_text)
-        log_step(trace_id, "generation_fallback", {"mode": "retrieval_only"})
-    else:
-        answer_text, generated_tokens = generate_with_openai(
+    generation_started = time.perf_counter()
+    request_log.add_step("generation_started", {"source_count": len(filtered_chunks)})
+
+    answer_text, confidence, confidence_reason, generated_tokens, generation_obs = (
+        generate_answer_from_chunks(
             question.question,
             filtered_chunks,
+            use_llm=bool(os.getenv("OPENAI_API_KEY")),
+            raw_candidate_count=len(raw_candidates),
         )
-        log_step(trace_id, "generation_completed", {"generated_tokens": generated_tokens})
+    )
+    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
 
-    token_usage = generated_tokens if generated_tokens is not None else estimate_token_usage(question.question, answer_text)
+    if generation_obs.get("llm_prompt"):
+        request_log.log_llm_prompt(generation_obs["llm_prompt"])
+    if generation_obs.get("model_response") is not None:
+        request_log.log_model_response(
+            generation_obs["model_response"],
+            token_usage=generated_tokens,
+        )
+
+    generation_mode = generation_obs.get("generation_mode", "unknown")
+    request_log.log_answer(answer_text, generation_mode=generation_mode)
+    request_log.add_step(
+        "confidence_computed",
+        {
+            "confidence": confidence,
+            "confidence_reason": confidence_reason,
+            "filtered_doc_count": len(filtered_chunks),
+        },
+    )
+
+    total_latency_ms = (datetime.utcnow() - started_at).total_seconds() * 1000.0
+    request_log.log_latency(
+        total_ms=total_latency_ms,
+        retrieval_ms=retrieval_latency_ms,
+        generation_ms=generation_latency_ms,
+    )
+
+    token_usage = (
+        generated_tokens
+        if generated_tokens is not None
+        else estimate_token_usage(question.question, answer_text)
+    )
     groundedness_score = confidence * 100.0
-    failure_type = determine_failure_type(retrieved_chunks, confidence, top_similarity, answer_text, groundedness_score)
+    failure_type = determine_failure_type(
+        filtered_chunks,
+        confidence,
+        top_similarity,
+        answer_text,
+        groundedness_score,
+    )
 
+    trace = request_log.to_trace_dict()
     trace.update({
         "answer": answer_text,
         "confidence": confidence,
         "confidence_reason": confidence_reason,
         "groundedness_score": groundedness_score,
         "failure_type": failure_type,
-        "latency_ms": (datetime.utcnow() - started_at).total_seconds() * 1000.0,
         "token_usage": token_usage,
         "evaluation": {
             "top_similarity": top_similarity,
@@ -420,22 +327,24 @@ def ask(question: Question, final_k: int = FINAL_K):
         },
     })
     save_trace(trace)
+    request_log.save_json_file()
+
+    log_event(logger, "request_completed", trace_id=trace_id, latency_ms=total_latency_ms)
 
     if DEBUG_MODE:
         print(f"TRACE SUMMARY: {trace_id}")
         print(f"  query={question.question}")
         print(f"  failure_type={failure_type}")
-        print(f"  groundedness_score={groundedness_score}")
-        print(f"  retrieved_chunks={len(retrieved_chunks)}")
-        for chunk in retrieved_chunks:
-            print(f"    - {chunk['source_file']} similarity={chunk['similarity_score']:.4f}")
+        print(f"  latency_ms={total_latency_ms:.1f}")
+        print(f"  retrieved_chunks={len(filtered_chunks)}")
 
     return Answer(
         answer=answer_text,
-        sources=[m.get("source_file", "unknown") for m in filtered_metas],
+        sources=_chunk_sources(filtered_chunks) if filtered_chunks else [],
         confidence=confidence,
         confidence_reason=confidence_reason,
-        retrieved_chunks=filtered_chunks,
+        top_k=final_k,
+        retrieved_chunks=_serialize_chunks(filtered_chunks) if filtered_chunks else [],
         trace_id=trace_id,
     )
 

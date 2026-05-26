@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import sqlite3
 import uuid
 from datetime import datetime
@@ -8,6 +7,15 @@ from pathlib import Path
 
 TRACES_DIR = Path(__file__).resolve().parents[1] / "traces"
 DB_PATH = TRACES_DIR / "traces.db"
+REQUEST_LOGS_DIR = TRACES_DIR / "requests"
+
+_TRACE_EXTRA_COLUMNS = {
+    "llm_prompt_json": "TEXT",
+    "model_response": "TEXT",
+    "generation_mode": "TEXT",
+    "retrieval_latency_ms": "REAL",
+    "generation_latency_ms": "REAL",
+}
 
 
 class JsonFormatter(logging.Formatter):
@@ -71,12 +79,19 @@ class TraceStore:
                 )
                 """
             )
+            self._migrate_schema(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_traces_created_at
                 ON traces(created_at DESC)
                 """
             )
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(traces)")}
+        for column, column_type in _TRACE_EXTRA_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE traces ADD COLUMN {column} {column_type}")
 
     def save_trace(self, trace: dict):
         with self._get_connection() as conn:
@@ -95,8 +110,13 @@ class TraceStore:
                     token_usage,
                     step_logs_json,
                     evaluation_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at,
+                    llm_prompt_json,
+                    model_response,
+                    generation_mode,
+                    retrieval_latency_ms,
+                    generation_latency_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trace.get("trace_id"),
@@ -112,6 +132,13 @@ class TraceStore:
                     json.dumps(trace.get("step_logs", []), default=str),
                     json.dumps(trace.get("evaluation", {}), default=str),
                     trace.get("created_at"),
+                    json.dumps(trace.get("llm_prompt"), default=str)
+                    if trace.get("llm_prompt") is not None
+                    else None,
+                    trace.get("model_response"),
+                    trace.get("generation_mode"),
+                    trace.get("retrieval_latency_ms"),
+                    trace.get("generation_latency_ms"),
                 ),
             )
 
@@ -154,9 +181,12 @@ class TraceStore:
         trace["retrieved_chunks"] = json.loads(trace.get("retrieved_chunks_json", "[]"))
         trace["step_logs"] = json.loads(trace.get("step_logs_json", "[]"))
         trace["evaluation"] = json.loads(trace.get("evaluation_json", "{}"))
+        llm_prompt_json = trace.get("llm_prompt_json")
+        trace["llm_prompt"] = json.loads(llm_prompt_json) if llm_prompt_json else None
         trace.pop("retrieved_chunks_json", None)
         trace.pop("step_logs_json", None)
         trace.pop("evaluation_json", None)
+        trace.pop("llm_prompt_json", None)
         return trace
 
 

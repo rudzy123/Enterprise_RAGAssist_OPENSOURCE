@@ -37,7 +37,7 @@ def generate_answer_with_citations(query: str):
     print("STEP 2: GENERATE ANSWER")
     print("=" * 80)
 
-    answer, confidence, confidence_reason = generate_answer_from_chunks(
+    answer, confidence, confidence_reason, _, _ = generate_answer_from_chunks(
         query,
         chunks,
         use_llm=bool(os.getenv("OPENAI_API_KEY")),

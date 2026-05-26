@@ -27,6 +27,11 @@ def summarize_single_run(results: list) -> dict:
 
     return {
         "total_cases": total,
+        "pct_with_citations": avg("has_citations") if "has_citations" in metrics_list[0] else None,
+        "pct_grounded": avg("grounded") if "grounded" in metrics_list[0] else None,
+        "avg_groundedness_score": avg("groundedness_score")
+        if "groundedness_score" in metrics_list[0]
+        else None,
         "precision_at_k": avg("precision_at_k"),
         "mrr": sum(m["reciprocal_rank"] for m in metrics_list) / total,
         "abstention_rate": sum(1 for m in metrics_list if m["abstained"]) / total,

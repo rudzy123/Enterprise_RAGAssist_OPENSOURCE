@@ -2,21 +2,31 @@
 
 from unittest.mock import MagicMock, patch
 
-from answer_generation.confidence import is_low_confidence
+from answer_generation.confidence import assess_retrieval_context, is_low_confidence
 from answer_generation.generation import (
     answer_has_chunk_citations,
     build_generation_prompt,
     chunk_citation,
+    ensure_cited_answer,
     format_chunks_for_prompt,
     generate_answer_from_chunks,
     generate_retrieval_only_answer,
     generate_with_openai,
 )
-from config import NOT_FOUND_ANSWER
+from config import MIN_SIMILARITY_THRESHOLD, NOT_FOUND_ANSWER
 
 
 def test_chunk_citation_format():
     chunk = {"source_file": "policy.md", "section_title": "Purpose"}
+    assert chunk_citation(chunk) == "[policy.md - Purpose]"
+
+
+def test_chunk_citation_uses_document_source():
+    chunk = {
+        "source_file": "policy.md",
+        "section_title": "Purpose",
+        "document_source": "policy.md - Purpose",
+    }
     assert chunk_citation(chunk) == "[policy.md - Purpose]"
 
 
@@ -44,14 +54,40 @@ def test_low_confidence_returns_not_found():
             "distance": 0.9,
         }
     ]
-    answer, confidence, _ = generate_answer_from_chunks(
+    answer, confidence, _, _, _ = generate_answer_from_chunks(
         "q",
         chunks,
-        confidence=0.1,
         use_llm=False,
     )
     assert answer == NOT_FOUND_ANSWER
     assert is_low_confidence(confidence)
+
+
+def test_weak_top_similarity_returns_not_found():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "Intro",
+            "text": "Hello",
+            "similarity_score": MIN_SIMILARITY_THRESHOLD - 0.05,
+            "distance": 1.05 - MIN_SIMILARITY_THRESHOLD,
+        }
+    ]
+    answer, confidence, reason, _, _ = generate_answer_from_chunks(
+        "q",
+        chunks,
+        use_llm=False,
+    )
+    assert answer == NOT_FOUND_ANSWER
+    assert confidence == 0.0
+    assert "below relevance threshold" in reason
+
+
+def test_assess_retrieval_context_no_raw_candidates():
+    confidence, reason, is_weak = assess_retrieval_context([], raw_candidate_count=0)
+    assert is_weak
+    assert confidence == 0.0
+    assert reason == "No documents matched the query"
 
 
 def test_build_generation_prompt_requires_citations():
@@ -60,6 +96,7 @@ def test_build_generation_prompt_requires_citations():
     prompt = build_generation_prompt("What?", context, labels)
     assert "[a.md - S]" in prompt
     assert NOT_FOUND_ANSWER in prompt
+    assert "ONLY" in prompt
     assert "inline citation" in prompt.lower()
 
 
@@ -67,6 +104,20 @@ def test_answer_has_chunk_citations():
     chunks = [{"source_file": "a.md", "section_title": "S", "text": "x"}]
     assert answer_has_chunk_citations("Fact [a.md - S].", chunks)
     assert not answer_has_chunk_citations("Fact without cite.", chunks)
+
+
+def test_ensure_cited_answer_falls_back_to_snippets():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "S",
+            "text": "Important text",
+            "similarity_score": 0.9,
+        }
+    ]
+    answer = ensure_cited_answer("Uncited answer.", chunks)
+    assert "[a.md - S]" in answer
+    assert "Important text" in answer
 
 
 def test_generate_with_openai_fallback_when_no_citations():
@@ -84,7 +135,27 @@ def test_generate_with_openai_fallback_when_no_citations():
 
     with patch("answer_generation.generation.openai.OpenAI") as mock_client:
         mock_client.return_value.chat.completions.create.return_value = mock_response
-        answer, _ = generate_with_openai("q", chunks, api_key="test-key")
+        answer, _, _ = generate_with_openai("q", chunks, api_key="test-key")
 
     assert "[a.md - S]" in answer
     assert "Important text" in answer
+
+
+def test_strong_context_returns_cited_answer():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "Intro",
+            "text": "Incident response starts with detection.",
+            "similarity_score": 0.85,
+        }
+    ]
+    answer, confidence, _, _, obs = generate_answer_from_chunks(
+        "How does incident response start?",
+        chunks,
+        use_llm=False,
+    )
+    assert answer != NOT_FOUND_ANSWER
+    assert "[a.md - Intro]" in answer
+    assert confidence > 0.3
+    assert obs["generation_mode"] == "retrieval_only"

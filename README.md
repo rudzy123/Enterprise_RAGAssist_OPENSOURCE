@@ -1,145 +1,378 @@
 # Enterprise RAG Assistant
 
-A production-style Retrieval-Augmented Generation (RAG) system built for enterprise security document retrieval and evaluation.
+A retrieval-first RAG system for enterprise security documentation. The stack prioritizes **measurable retrieval quality**, **grounded answers with citations**, and **per-request observability** before trusting generative output.
 
-This project is engineered to prioritize retrieval quality over free-form generation: it uses pure vector search, measurable evaluation metrics, and structured debugging to improve real-world enterprise knowledge access.
+---
 
-## Project Overview
+## Problem Statement
 
-Enterprise teams use this system to query security documentation such as:
-- NIST SP 800-53
-- NIST SP 800-61
-- Internal access control and incident response policies
+Enterprise security teams rely on fragmented policy corpora—NIST publications, internal runbooks, and access-control standards spread across many Markdown files. Practitioners need fast, trustworthy answers, but face recurring gaps:
 
-The system was built to solve a practical problem: enterprise documentation is fragmented, and retrieval quality must be measured and improved before any generative layer is trusted.
+| Challenge | Impact |
+|-----------|--------|
+| **Fragmented knowledge** | Critical guidance is split across sections and documents with no single search surface. |
+| **Unverifiable AI answers** | Generic chatbots invent policies or omit sources, creating compliance risk. |
+| **Opaque retrieval** | Without logged chunks, prompts, and scores, failures are hard to debug. |
+| **Weak context** | Low-similarity matches lead to confident but wrong answers. |
 
-## Key Features
+This project addresses those gaps with a pipeline that **retrieves evidence first**, **refuses to answer when context is weak**, **requires inline citations**, and **evaluates retrieval and answer quality** on a fixed question set.
 
-- Semantic search over enterprise security content
-- ChromaDB vector indexing for persistent retrieval
-- Chunk-based retrieval with source metadata
-- Evaluation framework for precision, recall, and hit rate
-- Retrieval-only mode with no API key required
-- Observability and trace debugging for retrieval failures
+**Corpus (curated):** `access_control_policy.md`, `incident_response_runbook.md`, `nist_800_53_selected_controls.md`, `nist_800_61_incident_response.md`
+
+---
 
 ## Architecture
 
 ```
-ingestion → embedding → vector DB → retrieval → rerank → evaluation
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           OFFLINE: INGESTION                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  data/docs/curated/*.md                                                      │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ingest_curated_md.py  ──►  section split (### / ##)  ──►  word chunks      │
+│       │                         (250 words, 50 overlap)                      │
+│       ▼                                                                      │
+│  embed_and_store.py    ──►  all-MiniLM-L6-v2  ──►  ChromaDB (cosine)       │
+│                              collection: enterprise_docs                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ONLINE: QUERY PATH                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Client (FastAPI /ask, Streamlit, CLI)                                      │
+│       │                                                                      │
+│       ▼                                                                      │
+│   ┌──────────────────┐     trace_id + RequestLogger                          │
+│   │ retrieve_chunks  │────► vector search (k=15)                             │
+│   │                  │────► min similarity filter (≥ 0.40)                   │
+│   │                  │────► cross-encoder rerank (optional)                  │
+│   │                  │────► per-file cap (max 2) ──► final_k (default 3)     │
+│   └────────┬─────────┘                                                       │
+│            │ enriched chunks: rank, document_source, text_preview, scores    │
+│            ▼                                                                 │
+│   ┌──────────────────┐                                                       │
+│   │ answer generation│────► confidence gate (weak context → "Not found")    │
+│   │                  │────► LLM (OpenAI) OR retrieval-only cited snippets    │
+│   │                  │────► mandatory [file.md - Section] citations          │
+│   └────────┬─────────┘                                                       │
+│            ▼                                                                 │
+│   Response + trace_id  │  SQLite traces.db  │  traces/requests/{id}.json    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           EVALUATION (offline)                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  evals/questions.jsonl (65 Q&A pairs)  ──►  run_evals.py                       │
+│       │                                                                      │
+│       ├── retrieval: P@k, recall@k, MRR, hit rate, abstention                 │
+│       └── answers: citations %, groundedness %, confidence                   │
+│            ▼                                                                 │
+│       evals/results_YYYYMMDD_HHMMSS.json                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Ingestion**: Markdown documents are parsed, chunked, and embedded
-- **Embedding**: SentenceTransformers convert text into vector representations
-- **Vector DB**: ChromaDB stores document vectors and metadata
-- **Retrieval**: Bi-encoder search (`all-MiniLM-L6-v2`) over top candidates (`retrieve_k=15`)
-- **Reranking**: Cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) rescores filtered chunks
-- **Evaluation**: Metrics drive tuning and monitor retrieval quality
+### Tech stack
 
-## Tech Stack
+| Layer | Technology |
+|-------|------------|
+| API | FastAPI, Pydantic |
+| UI | Streamlit |
+| Vectors | ChromaDB (persistent, cosine HNSW) |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| Generation | OpenAI API (`gpt-3.5-turbo`, optional) |
+| Observability | JSON logs, SQLite traces, per-request JSON files |
 
-- Python
-- ChromaDB
-- SentenceTransformers
-- FastAPI
-- SQLite (observability/tracing)
+---
 
-## Evaluation Framework
+## Ingestion Pipeline
 
-Retrieval quality is the core measure in this system. The evaluation framework computes:
+Ingestion turns curated Markdown into searchable, citation-friendly chunks.
 
-- **precision@k**: Relevant chunks in the top-k slots / k
-- **recall@k**: Expected documents found within the top-k chunks
-- **MRR** (mean reciprocal rank): Average of 1/rank for the first relevant chunk
-- **abstention_rate**: Fraction of queries where retrieval returns no chunks (below similarity threshold)
-- **retrieval_hit / precision / recall**: File-level source overlap metrics (legacy summary)
+### 1. Section-aware parsing (`ingestion/ingest_curated_md.py`)
 
-Run a parameter sweep over `final_k` and `min_chunk_similarity` with `--sweep` to find the best retrieval config.
+- Reads all `*.md` files under `data/docs/curated/`.
+- Splits on `###` headers when present; otherwise falls back to `##`.
+- Each section becomes a logical unit with `source_file` and `section_title` metadata.
+- Long sections are word-chunked (**250 words**, **50-word overlap**); multi-part sections are labeled e.g. `Purpose (part 2/3)`.
 
-These metrics enable targeted improvements and expose retrieval tradeoffs clearly.
+### 2. Embedding and storage (`ingestion/embed_and_store.py`)
 
-## Retrieval Optimization (Sprint 3)
-
-This project uses evaluation signals to tune retrieval behavior:
-
-- **retrieve_k=15** bi-encoder candidates, **final_k=3** after rerank and caps
-- Cosine similarity threshold (`similarity = 1 - distance`, default `0.40`) filters weak matches (no fallback)
-- **Cross-encoder rerank** (`ms-marco-MiniLM-L-6-v2`) improves ordering before per-document caps
-- Max **2 chunks per source file** to reduce cross-document noise
-- Evaluation feedback balances precision and recall for real data
-
-Disable reranking with `RERANK_ENABLED=false` if you need faster CPU-only runs.
-
-## Performance Results
-
-From the latest evaluation on 65 test questions:
-
-- **Retrieval Hit Rate**: 0.85
-- **Average Precision**: 0.55
-- **Average Recall**: 0.85
-
-**Interpretation**:
-- Strong recall indicates good document coverage
-- Moderate precision reveals semantic over-retrieval noise
-- This makes the system reliable for finding relevant enterprise context while still highlighting areas for tuning
-
-## How to Run
-
-### Install dependencies
-
-```bash
-git clone https://github.com/rudzy123/Enterprise_Rag_Assistant.git
-cd Enterprise_Rag_Assistant
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Ingest documents
+- Embeds chunk text with **all-MiniLM-L6-v2** (384-dim).
+- Stores in Chroma collection **`enterprise_docs`** with cosine distance.
+- Persists IDs, embeddings, full text, and metadata (`source_file`, `section_title`).
 
 ```bash
 python ingestion/embed_and_store.py
 ```
 
-### Run retrieval
+> **Note:** `POST /ingest` in `main.py` is a simpler alternate path (section split on `##` only). For production ingestion, use the curated pipeline above.
 
-```bash
-python retrieval/retrieve_chunks.py
+---
+
+## Retrieval + Generation Flow
+
+### Retrieval pipeline (`retrieval/retrieve_chunks.py`)
+
+| Stage | Default | Purpose |
+|-------|---------|---------|
+| Bi-encoder search | `retrieve_k = 15` | Fetch vector candidates from Chroma |
+| Similarity filter | `min_similarity ≥ 0.40` | Drop weak matches (no fallback) |
+| Cross-encoder rerank | `rerank_top_n = 15` | Rescore query–passage pairs |
+| Per-document cap | `max 2 per file` | Reduce single-doc dominance |
+| Final selection | `final_k = 3` | Chunks passed to generation |
+
+Each returned chunk includes: `similarity_score`, `distance`, optional `rerank_score`, `document_source`, `text_preview`, and `rank`.
+
+Structured JSON logs are emitted per stage when `RETRIEVAL_STRUCTURED_LOGS=true` (candidates, similarity filter, rerank, final selection, consolidated `retrieval_results`).
+
+### Answer generation (`answer_generation/generation.py`)
+
+1. **Assess retrieval context** — abstain if no chunks, top similarity &lt; 0.35, or composite confidence &lt; 0.3.
+2. **Generate** — OpenAI with a retrieval-only prompt, or cited snippet concatenation when no API key.
+3. **Enforce citations** — every non–`Not found` answer must contain `[file.md - Section]` labels; uncited LLM output falls back to cited snippets.
+
+### API response (`POST /ask`)
+
+```json
+{
+  "answer": "...",
+  "sources": ["access_control_policy.md - Purpose"],
+  "confidence": 0.72,
+  "confidence_reason": "Multiple sections retrieved; high similarity to query",
+  "top_k": 3,
+  "retrieved_chunks": [ { "rank": 1, "document_source": "...", "similarity_score": 0.81, "text_preview": "..." } ],
+  "trace_id": "uuid"
+}
 ```
 
-### Run evaluation
+### Observability (per request)
+
+Logged and stored for each `trace_id`:
+
+- Query text  
+- Retrieved chunk summaries  
+- Full LLM prompt (system + user messages)  
+- Raw model response  
+- Final answer and latencies (retrieval / generation / total)  
+
+Access via `GET /traces/{trace_id}` or `traces/requests/{trace_id}.json`.
+
+---
+
+## Evaluation Methodology
+
+Evaluations run **all 65 questions** from `evals/questions.jsonl`. Each line includes `question`, `expected_answer`, and `source_doc_id`.
 
 ```bash
-# Single config (precision@k, MRR, abstention rate)
-PYTHONPATH=. python -m evals.run_evals
+# Full RAG eval (retrieval + answer); uses OpenAI if OPENAI_API_KEY is set
+PYTHONPATH=. python evals/run_evals.py evals/questions.jsonl -v
 
-# Sweep final_k and min similarity
-PYTHONPATH=. python -m evals.run_evals --sweep
+# Retrieval-only answers (no LLM)
+PYTHONPATH=. python evals/run_evals.py --no-llm
 
-# Custom sweep grid
-PYTHONPATH=. python -m evals.run_evals --sweep --final-k-values 2,3,5 --min-similarity-values 0.35,0.40,0.45
+# Parameter sweep over final_k and min_similarity
+PYTHONPATH=. python evals/run_evals.py --sweep
 ```
 
-### Run API server
+Results are written to:
+
+- `evals/results_YYYYMMDD_HHMMSS.json` (timestamped)  
+- `evals/results.json` (latest)
+
+### Retrieval metrics
+
+| Metric | Definition |
+|--------|------------|
+| **Precision@k** | Relevant chunks in top-k slots ÷ k |
+| **Recall@k** | Expected source files found in top-k ÷ expected count |
+| **Hit@k** | At least one relevant chunk in top-k |
+| **MRR** | Mean reciprocal rank of first relevant chunk |
+| **Abstention rate** | Queries returning zero chunks after filtering |
+| **Hit rate** | File-level: expected `source_doc_id` appears in returned set |
+
+### Answer metrics
+
+| Metric | Definition |
+|--------|------------|
+| **has_citations** | Answer contains at least one `[file - section]` label from retrieved chunks |
+| **grounded** (heuristic) | Token overlap ≥ 40% with chunk text, or valid abstention when context is insufficient |
+| **confidence** | Retrieval-quality score from similarity, chunk count, and source consistency |
+
+### Summary output
+
+```
+Total questions:     65
+% with citations:    82.3%
+% grounded:          76.9%
+Hit@k:               0.800
+MRR:                 0.736
+Abstention rate:     0.262
+```
+
+Analyze saved runs:
 
 ```bash
-python main.py
+python evals/analyze_results.py evals/results.json
 ```
+
+---
+
+## Known Limitations
+
+| Area | Limitation |
+|------|------------|
+| **Retrieval** | Pure dense retrieval only—no BM25/hybrid search; semantic drift can pull related but wrong documents (e.g. multiple NIST docs). |
+| **Chunking** | Fixed word windows may split tables, lists, or cross-references awkwardly. |
+| **Reranking** | Cross-encoder adds latency and CPU/GPU cost; disabled in some eval runs for speed. |
+| **Groundedness eval** | Heuristic token overlap ≠ human judgment; does not measure factual correctness against `expected_answer`. |
+| **Generation** | `gpt-3.5-turbo` may paraphrase; citation enforcement is pattern-based, not claim-level verification. |
+| **Abstention** | Thresholds (`0.40` chunk filter, `0.35` relevance, `0.30` confidence) are static—not calibrated per domain. |
+| **Scale** | Small curated corpus (~4 docs); behavior on large multi-tenant corpora is untested. |
+| **Security** | No auth on API endpoints; traces may contain full prompts and document excerpts. |
+| **Ingest API** | `POST /ingest` path lacks section metadata parity with the main ingestion pipeline. |
+
+---
+
+## Example Outputs
+
+### Retrieval result (chunk record)
+
+```json
+{
+  "rank": 1,
+  "chunk_id": "access_control_policy_0_0",
+  "source_file": "access_control_policy.md",
+  "section_title": "Purpose",
+  "document_source": "access_control_policy.md - Purpose",
+  "similarity_score": 0.812,
+  "distance": 0.188,
+  "text_preview": "This policy defines requirements for managing logical access to organizational systems and data...",
+  "text": "<full chunk text>"
+}
+```
+
+### Grounded answer (retrieval-only mode)
+
+**Question:** What principle must access follow according to the policy?
+
+**Answer:**
+
+```text
+[access_control_policy.md - Access Requirements] Access must follow the principle of least privilege.
+```
+
+### Weak context (abstention)
+
+**Question:** What is the password rotation policy for contractors?
+
+**Answer:** `Not found`
+
+**Confidence:** `0.0` — *Top similarity score (0.28) below relevance threshold (0.35)*
+
+### Eval snippet (per question)
+
+```json
+{
+  "question": "What is the purpose of the access control policy?",
+  "expected_source": "access_control_policy.md",
+  "metrics": {
+    "answer": "[access_control_policy.md - Purpose] This policy defines requirements for managing logical access...",
+    "has_citations": true,
+    "grounded": true,
+    "groundedness_score": 0.67,
+    "confidence": 0.71,
+    "hit_at_k": true,
+    "precision_at_k": 0.67,
+    "reciprocal_rank": 1.0,
+    "abstained": false
+  }
+}
+```
+
+### Structured retrieval log (stdout)
+
+```json
+{
+  "event": "retrieval_results",
+  "trace_id": "a1b2c3d4-...",
+  "query": "What are the incident response steps?",
+  "top_k": 3,
+  "count": 3,
+  "results": [
+    {
+      "rank": 1,
+      "document_source": "incident_response_runbook.md - Response Steps",
+      "similarity_score": 0.79,
+      "text_preview": "1. Identify and classify the incident 2. Contain affected systems..."
+    }
+  ]
+}
+```
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/rudzy123/Enterprise_Rag_Assistant.git
+cd Enterprise_Rag_Assistant
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Index documents
+python ingestion/embed_and_store.py
+
+# Optional: enable LLM answers
+export OPENAI_API_KEY=sk-...
+
+# API server
+uvicorn main:app --reload
+
+# Streamlit UI
+streamlit run app/app.py
+
+# Evaluation
+PYTHONPATH=. python evals/run_evals.py -v
+```
+
+### Configuration (environment)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETRIEVE_K` | `15` | Bi-encoder candidates |
+| `FINAL_K` | `3` | Chunks returned to generation |
+| `MIN_CHUNK_SIMILARITY` | `0.40` | Post-search filter |
+| `MIN_SIMILARITY_THRESHOLD` | `0.35` | Relevance gate before answering |
+| `LOW_CONFIDENCE_THRESHOLD` | `0.30` | Abstention threshold |
+| `RERANK_ENABLED` | `true` | Cross-encoder reranking |
+| `OPENAI_MODEL` | `gpt-3.5-turbo` | Generation model |
+| `NOT_FOUND_ANSWER` | `Not found` | Abstention text |
+
+---
 
 ## Project Structure
 
-- `retrieval/` — vector search and retrieval logic
-- `evals/` — evaluation harness, metrics, and test questions
-- `ingestion/` — document processing, embedding, and storage pipeline
-- `data/` — enterprise security documents and curated sources
-- `app/` — application code and UI integration
+```
+Enterprise_Rag_Assistant/
+├── main.py                 # FastAPI: /ask, /ingest, /traces
+├── config.py               # Central configuration
+├── ingestion/              # Markdown → chunks → Chroma
+├── retrieval/              # Search, rerank, structured logs
+├── answer_generation/      # Prompts, citations, confidence gating
+├── observability/          # RequestLogger, SQLite traces
+├── evals/                  # questions.jsonl, run_evals.py, metrics
+├── app/                    # Streamlit UI
+├── data/docs/curated/      # Source Markdown corpus
+├── chroma_db/              # Vector store (generated)
+└── traces/                 # traces.db + requests/*.json
+```
 
-## Future Improvements
+---
 
-- Add reranking models to improve precision
-- Implement hybrid keyword + vector search
-- Layer LLM generation on top of retrieval with grounded citations
-- Add adaptive monitoring for retrieval drift and document coverage
+## License
 
-## Conclusion
-
-This repository demonstrates a practical, evaluation-driven RAG architecture for enterprise knowledge retrieval. It emphasizes measurable retrieval quality, data-driven tuning, and production-ready observability rather than relying purely on generative output.
+See repository license terms. Curated documents are for knowledge-retrieval demonstration; verify against official sources for compliance use.

@@ -2,7 +2,8 @@
 
 from typing import List, Tuple
 
-from config import LOW_CONFIDENCE_THRESHOLD
+from config import LOW_CONFIDENCE_THRESHOLD, MIN_CHUNK_SIMILARITY, MIN_SIMILARITY_THRESHOLD
+from retrieval.similarity import chunk_similarity_score, max_similarity
 
 
 def compute_retrieval_confidence(
@@ -60,3 +61,51 @@ def compute_retrieval_confidence(
 
 def is_low_confidence(confidence: float) -> bool:
     return confidence < LOW_CONFIDENCE_THRESHOLD
+
+
+def assess_retrieval_context(
+    chunks: List[dict],
+    *,
+    raw_candidate_count: int = 0,
+) -> Tuple[float, str, bool]:
+    """
+    Score retrieval quality and decide whether context is too weak to answer.
+
+    Returns:
+        (confidence, confidence_reason, is_weak_context)
+    """
+    if not chunks:
+        if raw_candidate_count == 0:
+            return 0.0, "No documents matched the query", True
+        return (
+            0.0,
+            f"No retrieved chunks met similarity threshold ({MIN_CHUNK_SIMILARITY})",
+            True,
+        )
+
+    metadatas = [
+        {"source_file": c["source_file"], "section_title": c.get("section_title")}
+        for c in chunks
+    ]
+    similarity_scores = [chunk_similarity_score(c) for c in chunks]
+    confidence, reason = compute_retrieval_confidence(
+        num_docs=len(chunks),
+        similarity_scores=similarity_scores,
+        metadatas=metadatas,
+    )
+
+    top_similarity = max_similarity(similarity_scores)
+    if top_similarity is not None and top_similarity < MIN_SIMILARITY_THRESHOLD:
+        weak_reason = (
+            f"Top similarity score ({top_similarity:.2f}) below relevance threshold "
+            f"({MIN_SIMILARITY_THRESHOLD})"
+        )
+        return 0.0, weak_reason, True
+
+    if is_low_confidence(confidence):
+        weak_reason = (
+            f"{reason}; below confidence threshold ({LOW_CONFIDENCE_THRESHOLD})"
+        )
+        return confidence, weak_reason, True
+
+    return confidence, reason, False

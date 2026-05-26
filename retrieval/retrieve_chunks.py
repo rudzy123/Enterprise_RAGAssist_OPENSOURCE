@@ -27,6 +27,7 @@ from config import (
 from observability import setup_json_logger
 from retrieval.rerank import rerank_chunks
 from retrieval.similarity import cosine_similarity_from_distance
+from retrieval.result_format import enrich_retrieved_chunks
 from retrieval.structured_logs import log_retrieval_pipeline
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -165,7 +166,7 @@ def retrieve_similar_chunks(
         reranked = list(rerank_input)
 
     capped = _apply_per_document_cap(reranked, max_chunks_per_file)
-    final_chunks = capped[:final_k]
+    final_chunks = enrich_retrieved_chunks(capped[:final_k])
 
     if structured_logs:
         log_retrieval_pipeline(
@@ -201,10 +202,11 @@ def retrieve_similar_chunks(
     if return_trace:
         return {
             "chunks": final_chunks,
+            "top_k": final_k,
             "raw_candidates": raw_candidates,
             "threshold_passed": threshold_passed,
             "reranked": reranked,
-            "capped": capped,
+            "capped": enrich_retrieved_chunks(capped),
             "retrieve_k": retrieve_k,
             "final_k": final_k,
             "min_similarity": min_similarity,
@@ -225,6 +227,7 @@ def _empty_trace(
 ) -> dict:
     return {
         "chunks": [],
+        "top_k": final_k,
         "raw_candidates": [],
         "threshold_passed": [],
         "reranked": [],
