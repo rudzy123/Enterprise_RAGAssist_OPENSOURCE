@@ -4,7 +4,7 @@ Format retrieval results with rank, document source, and text preview.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 TEXT_PREVIEW_LEN = 120
 

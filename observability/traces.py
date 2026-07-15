@@ -1,7 +1,6 @@
 import json
 import logging
 import sqlite3
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 

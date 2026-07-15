@@ -4,7 +4,6 @@ Reciprocal Rank Fusion (RRF) for combining dense and sparse retrieval rankings.
 
 from __future__ import annotations
 
-import logging
 from typing import Dict, List, Optional, Tuple
 
 from observability import setup_json_logger

@@ -14,34 +14,43 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
-from core.config import (
-    EVAL_MAX_ABSTENTION_RATE,
-    EVAL_MIN_HIT_AT_K,
-    EVAL_MIN_MRR,
-    EVAL_MIN_PRECISION_AT_K,
-    EVAL_MIN_PCT_GROUNDED,
-)
+
+def _ensure_path() -> None:
+    """Add project root to sys.path for local package imports."""
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
 
 
 def _load_summary(path: Path) -> dict:
+    _ensure_path()
+    from evals.metrics import aggregate_metrics
+
     payload = json.loads(path.read_text(encoding="utf-8"))
     summary = payload.get("summary") or payload
     if "hit_at_k" not in summary and "results" in payload:
-        from evals.metrics import aggregate_metrics
-
         summary = aggregate_metrics([r["metrics"] for r in payload["results"]])
     return summary
 
 
 def _check_thresholds(summary: dict) -> list[str]:
     """Return list of failed gate messages (empty == pass)."""
+    _ensure_path()
+    from core.config import (
+        EVAL_MAX_ABSTENTION_RATE,
+        EVAL_MIN_HIT_AT_K,
+        EVAL_MIN_MRR,
+        EVAL_MIN_PCT_GROUNDED,
+        EVAL_MIN_PRECISION_AT_K,
+    )
+
     failures = []
 
     checks = [
@@ -62,6 +71,15 @@ def _check_thresholds(summary: dict) -> list[str]:
 
 
 def main() -> int:
+    _ensure_path()
+    from core.config import (
+        EVAL_MAX_ABSTENTION_RATE,
+        EVAL_MIN_HIT_AT_K,
+        EVAL_MIN_MRR,
+        EVAL_MIN_PCT_GROUNDED,
+        EVAL_MIN_PRECISION_AT_K,
+    )
+
     parser = argparse.ArgumentParser(description="Check RAG eval quality gates")
     parser.add_argument(
         "results_path",
@@ -86,7 +104,7 @@ def main() -> int:
             "--no-llm",
             "--no-rerank",
         ]
-        env = {**__import__("os").environ.copy(), "PYTHONPATH": str(ROOT)}
+        env = {**os.environ.copy(), "PYTHONPATH": str(ROOT)}
         result = subprocess.run(cmd, cwd=ROOT, env=env, check=False)
         if result.returncode != 0:
             print("Eval run failed.", file=sys.stderr)

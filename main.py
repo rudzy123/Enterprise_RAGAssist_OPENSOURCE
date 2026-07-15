@@ -16,6 +16,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from answer_generation.generation import generate_answer_from_chunks
 from core.auth import APIKeyMiddleware, extract_api_key
 from core.cache import cache_ping
 from core.config import (
@@ -33,14 +34,13 @@ from core.config import (
 )
 from core.embeddings import get_embedding_model
 from core.vector_store import collection_count
-from answer_generation.generation import generate_answer_from_chunks
 from ingestion.pipeline import ingest_corpus
-from retrieval.retrieve_chunks import retrieve_similar_chunks
-from retrieval.metadata_filter import merge_metadata_filters
-from retrieval.bm25_store import bm25_index_exists
-from retrieval.similarity import chunk_similarity_score, max_similarity
 from observability import TraceStore, configure_logging, log_event, setup_json_logger
 from observability.request_log import RequestLogger
+from retrieval.bm25_store import bm25_index_exists
+from retrieval.metadata_filter import merge_metadata_filters
+from retrieval.retrieve_chunks import retrieve_similar_chunks
+from retrieval.similarity import chunk_similarity_score, max_similarity
 
 # -------------------------------------------------
 # App factory / lifespan

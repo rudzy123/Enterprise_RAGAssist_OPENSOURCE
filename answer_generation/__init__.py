@@ -1,5 +1,3 @@
-from config import NOT_FOUND_ANSWER
-
 from answer_generation.confidence import (
     assess_retrieval_context,
     compute_retrieval_confidence,
@@ -12,6 +10,7 @@ from answer_generation.generation import (
     generate_retrieval_only_answer,
     generate_with_openai,
 )
+from config import NOT_FOUND_ANSWER
 
 __all__ = [
     "NOT_FOUND_ANSWER",

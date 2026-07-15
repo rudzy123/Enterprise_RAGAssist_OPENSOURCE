@@ -25,8 +25,8 @@ from core.config import (
     RERANK_ENABLED,
     RERANK_MODEL,
     RERANK_TOP_N,
-    RETRIEVE_K,
     RETRIEVAL_STRUCTURED_LOGS,
+    RETRIEVE_K,
     RRF_K,
 )
 from core.embeddings import encode_query
@@ -36,8 +36,8 @@ from retrieval.bm25_store import bm25_search
 from retrieval.hybrid import fuse_hybrid_candidates
 from retrieval.metadata_filter import build_chroma_where, normalize_metadata_filters
 from retrieval.rerank import rerank_chunks
-from retrieval.similarity import cosine_similarity_from_distance
 from retrieval.result_format import enrich_retrieved_chunks
+from retrieval.similarity import cosine_similarity_from_distance
 from retrieval.structured_logs import log_retrieval_pipeline
 
 COLLECTION_NAME = CHROMA_COLLECTION_NAME

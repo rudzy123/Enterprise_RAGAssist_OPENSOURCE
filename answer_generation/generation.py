@@ -12,8 +12,8 @@ from typing import List, Optional, Tuple
 
 import openai
 
-from config import NOT_FOUND_ANSWER, OPENAI_MODEL
 from answer_generation.confidence import assess_retrieval_context
+from config import NOT_FOUND_ANSWER, OPENAI_MODEL
 
 
 def chunk_citation(chunk: dict) -> str:

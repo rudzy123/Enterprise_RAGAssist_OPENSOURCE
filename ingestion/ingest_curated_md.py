@@ -38,7 +38,7 @@ def split_markdown_sections(text: str):
     Splits markdown text into sections.
     Prefers ### sections; falls back to ## sections.
     Returns a list of (section_title, section_text).
-    
+
     Robust to:
     - Files with only ## headers
     - Files with only ### headers

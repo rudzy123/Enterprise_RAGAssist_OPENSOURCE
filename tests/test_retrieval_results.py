@@ -67,7 +67,6 @@ def test_chunk_log_entry_includes_document_source():
 
 
 def test_log_retrieval_pipeline_emits_results_event():
-    import json
     import logging
     from unittest.mock import patch
 

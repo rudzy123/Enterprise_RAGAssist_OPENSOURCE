@@ -437,7 +437,7 @@ def main():
         print_summary(payload["summary"])
         ts_path, latest_path = save_results(payload)
 
-    print(f"\n✅ Results saved to:")
+    print("\n✅ Results saved to:")
     print(f"- {ts_path}")
     print(f"- {latest_path}")
 

@@ -7,7 +7,6 @@ Indexes are persisted as JSON under BM25_INDEX_DIR and loaded on demand.
 from __future__ import annotations
 
 import json
-import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple

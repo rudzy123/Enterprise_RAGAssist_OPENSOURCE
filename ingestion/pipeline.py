@@ -7,7 +7,7 @@ This is the canonical ingestion path for both CLI and the deprecated API endpoin
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from core.config import CHROMA_COLLECTION_NAME, CURATED_DOCS_DIR
 from core.embeddings import embed_texts

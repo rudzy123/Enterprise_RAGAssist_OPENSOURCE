@@ -11,7 +11,6 @@ from typing import List, Optional
 
 from observability import log_event
 from retrieval.result_format import (
-    TEXT_PREVIEW_LEN,
     format_document_source,
     make_text_preview,
 )

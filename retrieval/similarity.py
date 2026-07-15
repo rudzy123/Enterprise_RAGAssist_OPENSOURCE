@@ -7,7 +7,7 @@ comparable across the API, CLI, evals, and UI.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 Number = Union[int, float]
 

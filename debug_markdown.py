@@ -4,7 +4,6 @@ Comprehensive markdown parsing debugger.
 Inspects file contents, encoding, headers, and parsing logic.
 """
 
-import os
 import re
 from pathlib import Path
 
@@ -45,14 +44,14 @@ print("=" * 80)
 
 for md_file in md_files:
     print(f"\n------- {md_file.name} -------")
-    
+
     # Read raw bytes
     with open(md_file, "rb") as f:
         raw_bytes = f.read()
-    
+
     print(f"File size: {len(raw_bytes)} bytes")
     print(f"First 50 bytes (hex): {raw_bytes[:50].hex()}")
-    
+
     # Check for BOM
     if raw_bytes.startswith(b'\xef\xbb\xbf'):
         print("✓ UTF-8 BOM detected")
@@ -62,12 +61,12 @@ for md_file in md_files:
         print("⚠️  UTF-16-BE BOM detected")
     else:
         print("✓ No BOM detected")
-    
+
     # Try different encodings
     encodings_to_try = ["utf-8", "utf-8-sig", "latin-1", "ascii"]
     text = None
     successful_encoding = None
-    
+
     for enc in encodings_to_try:
         try:
             text = raw_bytes.decode(enc)
@@ -76,30 +75,30 @@ for md_file in md_files:
             break
         except UnicodeDecodeError as e:
             print(f"✗ Failed with {enc}: {e}")
-    
+
     if not text:
         print("✗ Could not decode file with any encoding!")
         continue
-    
+
     # ========================================================================
     # 3. HEADER DETECTION & CHARACTER INSPECTION
     # ========================================================================
-    
-    print(f"\n--- Character-level inspection ---")
-    
+
+    print("\n--- Character-level inspection ---")
+
     lines = text.splitlines()
     print(f"Total lines: {len(lines)}")
     print(f"Total characters: {len(text)}")
     print(f"Is empty: {len(text.strip()) == 0}")
-    
+
     # Find all lines that might be headers
-    print(f"\n--- Potential header lines ---")
+    print("\n--- Potential header lines ---")
     header_patterns = [
         (r"^#{1,6}\s+", "Markdown header (# to ######)"),
         (r"^#{1,6}(?!\s)", "Header without space after #"),
         (r"^\s+#{1,6}\s+", "Indented header"),
     ]
-    
+
     for pattern_str, description in header_patterns:
         pattern = re.compile(pattern_str)
         matches = [(i, line) for i, line in enumerate(lines) if pattern.match(line)]
@@ -107,26 +106,26 @@ for md_file in md_files:
             print(f"\n{description}:")
             for line_num, line in matches:
                 print(f"  Line {line_num}: {repr(line[:60])}")
-    
+
     # Specific check for ## and ###
-    print(f"\n--- Specific header searches ---")
+    print("\n--- Specific header searches ---")
     h2_lines = [line for line in lines if line.startswith("## ")]
     h3_lines = [line for line in lines if line.startswith("### ")]
     h2_no_space = [line for line in lines if line.startswith("##") and not line.startswith("## ")]
     h3_no_space = [line for line in lines if line.startswith("###") and not line.startswith("### ")]
-    
+
     print(f"Lines starting with '## ' (with space): {len(h2_lines)}")
     print(f"Lines starting with '### ' (with space): {len(h3_lines)}")
     print(f"Lines starting with '##' (no space): {len(h2_no_space)}")
     print(f"Lines starting with '###' (no space): {len(h3_no_space)}")
-    
+
     if h2_no_space:
         print(f"  Examples: {h2_no_space[:3]}")
     if h3_no_space:
         print(f"  Examples: {h3_no_space[:3]}")
-    
+
     # Show first 20 lines
-    print(f"\n--- First 20 lines (raw) ---")
+    print("\n--- First 20 lines (raw) ---")
     for i, line in enumerate(lines[:20]):
         print(f"{i:3d}: {repr(line)}")
 
@@ -180,10 +179,8 @@ def split_markdown_sections_robust(text: str):
 
     # First pass: detect what headers we have
     h3_count = sum(1 for line in lines if re.match(r"^###\s+", line))
-    h2_count = sum(1 for line in lines if re.match(r"^##\s+", line))
-    
+
     use_h3 = h3_count > 0
-    target_depth = 3 if use_h3 else 2
 
     for line in lines:
         # Match headers at the target depth
@@ -191,7 +188,7 @@ def split_markdown_sections_robust(text: str):
             match = re.match(r"^###\s+(.+)$", line)
         else:
             match = re.match(r"^##\s+(.+)$", line)
-        
+
         if match:
             # Flush previous section
             if current_title and current_body:
@@ -216,16 +213,16 @@ def split_markdown_sections_robust(text: str):
 for md_file in md_files:
     with open(md_file, "r", encoding="utf-8") as f:
         text = f.read()
-    
+
     print(f"\n--- Testing {md_file.name} ---")
-    
+
     sections_orig = split_markdown_sections_original(text)
     sections_robust = split_markdown_sections_robust(text)
-    
+
     print(f"Original parser: {len(sections_orig)} sections")
     for title, content in sections_orig[:3]:
         print(f"  - {title[:50]}: {len(content)} chars")
-    
+
     print(f"Robust parser: {len(sections_robust)} sections")
     for title, content in sections_robust[:3]:
         print(f"  - {title[:50]}: {len(content)} chars")

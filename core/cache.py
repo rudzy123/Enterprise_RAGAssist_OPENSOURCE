@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from typing import Any, Optional
 
 from core.config import CACHE_ENABLED, CACHE_TTL_SECONDS, REDIS_URL
