@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Data artifacts (mounted as volumes in production)
+chroma_db/
+traces/
+logs/
+*.sqlite
+
+# Git
+.git/
+.gitignore
+
+# Docs / dev
+*.md
+!README.md
+tests/
+evals/results*.json
+evals/sweep_results*.json
+
+# Cursor / local
+.cursor/

@@ -16,4 +16,5 @@ venv/
 # Data artifacts
 chroma_db/
 traces/
+logs/
 *.sqlite

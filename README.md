@@ -255,6 +255,89 @@ curl http://localhost:8000/ready
 
 ---
 
+## Production Deployment
+
+### Docker (recommended)
+
+```bash
+# 1. Configure secrets
+cp .env.example .env
+# Edit .env: set API_KEY, OPENAI_API_KEY (optional), DEBUG_MODE=false
+
+# 2. Build image
+docker compose build
+
+# 3. Index documents (one-time, persists to chroma_data volume)
+docker compose --profile ingest run --rm ingest
+
+# 4. Start API
+docker compose up -d api
+
+# 5. Verify health
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/ready | python3 -m json.tool
+# /ready returns HTTP 503 until the corpus is indexed
+```
+
+**Optional Redis cache** (speeds up repeated query embeddings):
+
+```bash
+# Start API + Redis
+docker compose --profile cache up -d
+
+# In .env:
+#   REDIS_URL=redis://redis:6379/0
+#   CACHE_ENABLED=true
+```
+
+### Security checklist
+
+| Item | Production setting |
+|------|-------------------|
+| `API_KEY` | Strong random secret; required |
+| `DEBUG_MODE` | `false` |
+| `OPENAI_API_KEY` | Set on server only, never in client |
+| Rate limiting | `RATE_LIMIT=30/minute` (tune per load) |
+| Logs | JSON to `logs/enterprise_rag.log` + stdout |
+| Traces | May contain prompts — restrict `/traces/*` access |
+
+### Observability
+
+- **Liveness:** `GET /health` → always `200` when process is up
+- **Readiness:** `GET /ready` → `200` when Chroma is populated (+ BM25 if `HYBRID_SEARCH=true`); `503` otherwise
+- **Logs:** structured JSON to console and rotating file (`LOG_DIR`, `LOG_MAX_BYTES`)
+- **Global errors:** sanitized `500` responses (details only when `DEBUG_MODE=true`)
+
+### CI/CD
+
+GitHub Actions workflow (`.github/workflows/ci.yml`):
+
+1. **Lint** — `ruff check .`
+2. **Unit tests** — `pytest tests/`
+3. **Eval gate** — ingest → eval → `scripts/check_eval_gate.py`
+
+Tune gate thresholds via env vars (`EVAL_MIN_HIT_AT_K`, `EVAL_MIN_MRR`, etc.).
+
+```bash
+# Run eval gate locally
+python ingestion/embed_and_store.py
+PYTHONPATH=. python evals/run_evals.py --no-llm --no-rerank
+python scripts/check_eval_gate.py evals/results.json
+```
+
+### Manual production start (no Docker)
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # set API_KEY, DEBUG_MODE=false
+python ingestion/embed_and_store.py
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+> Use `--workers 1` because embedding/rerank models are loaded in-process.
+
+---
+
 ## Configuration (environment)
 
 Loaded from `.env` via `core/config.py` (`python-dotenv`).
@@ -280,6 +363,13 @@ Loaded from `.env` via `core/config.py` (`python-dotenv`).
 | `OPENAI_MODEL` | `gpt-3.5-turbo` | Generation model |
 | `NOT_FOUND_ANSWER` | `Not found` | Abstention text |
 | `DEBUG_MODE` | `false` | FastAPI debug mode |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `LOG_DIR` / `LOG_FILE` | `logs/` | Rotating JSON log file path |
+| `REDIS_URL` | *(empty)* | Optional Redis for query-embedding cache |
+| `CACHE_ENABLED` | `false` | Enable Redis caching |
+| `UVICORN_WORKERS` | `1` | API worker processes (keep at 1 for ML models) |
+| `EVAL_MIN_HIT_AT_K` | `0.70` | CI eval gate: minimum hit@k |
+| `EVAL_MIN_MRR` | `0.65` | CI eval gate: minimum MRR |
 
 ---
 
@@ -288,11 +378,18 @@ Loaded from `.env` via `core/config.py` (`python-dotenv`).
 ```
 Enterprise_Rag_Assistant/
 ├── main.py                     # FastAPI: /ask, /health, /ready, /traces
+├── Dockerfile                  # Production container image
+├── docker-compose.yml          # API + optional Redis + ingest job
+├── scripts/
+│   ├── docker-entrypoint.sh    # Container startup
+│   └── check_eval_gate.py      # CI quality gate checker
+├── .github/workflows/ci.yml    # Lint + test + eval gate
 ├── config.py                   # Backward-compat shim → core.config
 ├── core/
 │   ├── config.py               # Central config + load_dotenv
 │   ├── embeddings.py           # SentenceTransformer singleton
 │   ├── vector_store.py         # Chroma client + collection management
+│   ├── cache.py                # Optional Redis cache
 │   └── auth.py                 # API key middleware
 ├── ingestion/
 │   ├── ingest_curated_md.py    # Section-aware Markdown chunking

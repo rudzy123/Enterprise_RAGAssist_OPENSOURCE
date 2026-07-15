@@ -66,6 +66,28 @@ LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.3"))
 NOT_FOUND_ANSWER = os.getenv("NOT_FOUND_ANSWER", "Not found")
 MAX_QUESTION_LENGTH = int(os.getenv("MAX_QUESTION_LENGTH", "2000"))
 
-# Observability
+# Observability / logging
 TRACES_DIR = BASE_DIR / "traces"
 TRACE_DB_PATH = TRACES_DIR / "traces.db"
+LOG_DIR = BASE_DIR / os.getenv("LOG_DIR", "logs")
+LOG_FILE = LOG_DIR / os.getenv("LOG_FILE", "enterprise_rag.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+
+# Optional Redis cache (embedding / hot-key cache)
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "false").lower() in ("1", "true", "yes")
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+
+# Server
+UVICORN_HOST = os.getenv("UVICORN_HOST", "0.0.0.0")
+UVICORN_PORT = int(os.getenv("UVICORN_PORT", "8000"))
+UVICORN_WORKERS = int(os.getenv("UVICORN_WORKERS", "1"))
+
+# CI / eval gate thresholds (used by scripts/check_eval_gate.py)
+EVAL_MIN_HIT_AT_K = float(os.getenv("EVAL_MIN_HIT_AT_K", "0.70"))
+EVAL_MIN_MRR = float(os.getenv("EVAL_MIN_MRR", "0.65"))
+EVAL_MIN_PRECISION_AT_K = float(os.getenv("EVAL_MIN_PRECISION_AT_K", "0.35"))
+EVAL_MAX_ABSTENTION_RATE = float(os.getenv("EVAL_MAX_ABSTENTION_RATE", "0.35"))
+EVAL_MIN_PCT_GROUNDED = float(os.getenv("EVAL_MIN_PCT_GROUNDED", "0.60"))

@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from observability.logging_config import JsonFormatter, configure_logging, setup_json_logger
+
 TRACES_DIR = Path(__file__).resolve().parents[1] / "traces"
 DB_PATH = TRACES_DIR / "traces.db"
 REQUEST_LOGS_DIR = TRACES_DIR / "requests"
@@ -18,35 +20,15 @@ _TRACE_EXTRA_COLUMNS = {
 }
 
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        message = record.getMessage()
-        payload = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "level": record.levelname,
-            "logger": record.name,
-            "message": message,
-        }
-
-        # Include any structured data passed through record
-        if hasattr(record, "extra") and isinstance(record.extra, dict):
-            payload.update(record.extra)
-
-        # Preserve exception info if present
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-
-        return json.dumps(payload, default=str)
-
-
-def setup_json_logger(name: str = "enterprise_rag", level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(JsonFormatter())
-        logger.addHandler(handler)
-    return logger
+# Re-export for backward compatibility.
+__all__ = [
+    "JsonFormatter",
+    "TraceStore",
+    "build_step_log",
+    "configure_logging",
+    "log_event",
+    "setup_json_logger",
+]
 
 
 class TraceStore:

@@ -1,5 +1,7 @@
 """
 Singleton embedding model for bi-encoder retrieval and ingestion.
+
+Optional Redis caching accelerates repeated query embeddings when CACHE_ENABLED=true.
 """
 
 from __future__ import annotations
@@ -9,7 +11,8 @@ from typing import List, Optional, Union
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from core.config import EMBEDDING_MODEL_NAME
+from core.cache import cache_get_json, cache_set_json
+from core.config import CACHE_ENABLED, EMBEDDING_MODEL_NAME
 
 _embedding_model: Optional[SentenceTransformer] = None
 
@@ -41,5 +44,17 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 
 def encode_query(query: str) -> Union[np.ndarray, List[float]]:
-    """Encode a query for vector search (returns raw model output)."""
-    return get_embedding_model().encode(query)
+    """Encode a query for vector search, with optional Redis cache."""
+    if CACHE_ENABLED:
+        cache_key = f"{EMBEDDING_MODEL_NAME}:{query}"
+        cached = cache_get_json("query_embedding", cache_key)
+        if cached is not None:
+            return np.array(cached, dtype=np.float32)
+
+    vector = get_embedding_model().encode(query)
+
+    if CACHE_ENABLED:
+        as_list = vector.tolist() if isinstance(vector, np.ndarray) else list(vector)
+        cache_set_json("query_embedding", cache_key, as_list)
+
+    return vector

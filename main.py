@@ -3,16 +3,21 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core.auth import APIKeyMiddleware, extract_api_key
+from core.cache import cache_ping
 from core.config import (
     API_KEY,
     DEBUG_MODE,
@@ -32,15 +37,55 @@ from answer_generation.generation import generate_answer_from_chunks
 from ingestion.pipeline import ingest_corpus
 from retrieval.retrieve_chunks import retrieve_similar_chunks
 from retrieval.metadata_filter import merge_metadata_filters
+from retrieval.bm25_store import bm25_index_exists
 from retrieval.similarity import chunk_similarity_score, max_similarity
-from observability import TraceStore, log_event, setup_json_logger
+from observability import TraceStore, configure_logging, log_event, setup_json_logger
 from observability.request_log import RequestLogger
 
 # -------------------------------------------------
-# App
+# App factory / lifespan
 # -------------------------------------------------
 
-app = FastAPI(title="Enterprise RAG Assistant", debug=DEBUG_MODE)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: logging, security checks. Shutdown: flush log handlers."""
+    configure_logging()
+    app.state.logger = setup_json_logger("enterprise_rag.api")
+
+    if not API_KEY:
+        app.state.logger.warning(
+            json.dumps(
+                {
+                    "event": "security_warning",
+                    "message": "API_KEY is not set; API endpoints are unauthenticated.",
+                }
+            )
+        )
+    else:
+        app.state.logger.info(
+            json.dumps({"event": "startup", "message": "API key authentication enabled."})
+        )
+
+    # Warm embedding model so /ready reflects true startup cost.
+    try:
+        get_embedding_model()
+        app.state.logger.info(json.dumps({"event": "startup", "embedding_model": "loaded"}))
+    except Exception as exc:
+        app.state.logger.error(
+            json.dumps({"event": "startup_error", "component": "embedding_model", "error": str(exc)})
+        )
+
+    yield
+
+    logging.shutdown()
+
+
+app = FastAPI(
+    title="Enterprise RAG Assistant",
+    debug=DEBUG_MODE,
+    lifespan=lifespan,
+)
 app.add_middleware(APIKeyMiddleware)
 
 
@@ -54,6 +99,11 @@ def _rate_limit_key(request: Request) -> str:
 limiter = Limiter(key_func=_rate_limit_key)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Initialize logging early so exception handlers can emit structured logs.
+configure_logging()
+logger = setup_json_logger("enterprise_rag.api")
+trace_store = TraceStore()
 
 # -------------------------------------------------
 # Models
@@ -103,14 +153,46 @@ class ReadyResponse(BaseModel):
     status: str
     collection_count: int
     embedding_model_loaded: bool
+    bm25_index_available: bool
+    redis_available: Optional[bool] = None
+    checks: Dict[str, bool]
 
 
 # -------------------------------------------------
-# Setup
+# Exception handlers (sanitized responses in production)
 # -------------------------------------------------
 
-logger = setup_json_logger()
-trace_store = TraceStore()
+
+def _error_detail(message: str, exc: Optional[Exception] = None) -> str:
+    if DEBUG_MODE and exc is not None:
+        return f"{message}: {exc}"
+    return message
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(
+        json.dumps({"event": "validation_error", "path": request.url.path, "errors": exc.errors()})
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        json.dumps({"event": "unhandled_exception", "path": request.url.path, "error": str(exc)}),
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": _error_detail("Internal server error", exc)},
+    )
+
 
 # -------------------------------------------------
 # Helper Functions
@@ -169,26 +251,50 @@ def save_trace(trace: dict):
 
 @app.get("/health", response_model=HealthResponse)
 def health():
-    """Liveness probe: process is running."""
+    """Liveness probe: process is running (always HTTP 200)."""
     return HealthResponse(status="ok")
 
 
 @app.get("/ready", response_model=ReadyResponse)
 def ready():
-    """Readiness probe: dependencies initialized and corpus indexed."""
+    """
+    Readiness probe: corpus indexed and models available.
+
+    Returns HTTP 503 when the service should not receive traffic.
+    """
     count = collection_count()
     model_loaded = get_embedding_model() is not None
-    if count <= 0:
-        return ReadyResponse(
-            status="not_ready",
-            collection_count=count,
-            embedding_model_loaded=model_loaded,
-        )
-    return ReadyResponse(
-        status="ready",
+    bm25_available = bm25_index_exists()
+    redis_available: Optional[bool] = cache_ping() if os.getenv("REDIS_URL") else None
+
+    checks = {
+        "collection_populated": count > 0,
+        "embedding_model_loaded": model_loaded,
+        "bm25_index_available": bm25_available,
+    }
+    if redis_available is not None:
+        checks["redis_available"] = redis_available
+
+    # BM25 is required only when hybrid search is enabled globally.
+    required_checks = ["collection_populated", "embedding_model_loaded"]
+    if HYBRID_SEARCH:
+        required_checks.append("bm25_index_available")
+
+    is_ready = all(checks.get(name, False) for name in required_checks)
+
+    payload = ReadyResponse(
+        status="ready" if is_ready else "not_ready",
         collection_count=count,
         embedding_model_loaded=model_loaded,
+        bm25_index_available=bm25_available,
+        redis_available=redis_available,
+        checks=checks,
     )
+
+    if not is_ready:
+        return JSONResponse(status_code=503, content=payload.model_dump())
+
+    return payload
 
 
 @app.post("/ingest", deprecated=True)
@@ -334,14 +440,25 @@ def ask(
     generation_started = time.perf_counter()
     request_log.add_step("generation_started", {"source_count": len(filtered_chunks)})
 
-    answer_text, confidence, confidence_reason, generated_tokens, generation_obs = (
-        generate_answer_from_chunks(
-            question.question,
-            filtered_chunks,
-            use_llm=bool(os.getenv("OPENAI_API_KEY")),
-            raw_candidate_count=len(raw_candidates),
+    try:
+        answer_text, confidence, confidence_reason, generated_tokens, generation_obs = (
+            generate_answer_from_chunks(
+                question.question,
+                filtered_chunks,
+                use_llm=bool(os.getenv("OPENAI_API_KEY")),
+                raw_candidate_count=len(raw_candidates),
+            )
         )
-    )
+    except Exception as exc:
+        logger.error(
+            json.dumps({"event": "generation_failed", "trace_id": trace_id, "error": str(exc)}),
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=_error_detail("Answer generation failed", exc),
+        ) from exc
+
     generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
 
     if generation_obs.get("llm_prompt"):
@@ -439,14 +556,4 @@ def get_trace(request: Request, trace_id: str):
     return trace
 
 
-@app.on_event("startup")
-def log_security_state():
-    if not API_KEY:
-        logger.warning(
-            json.dumps(
-                {
-                    "event": "security_warning",
-                    "message": "API_KEY is not set; API endpoints are unauthenticated.",
-                }
-            )
-        )
+# Note: startup logic lives in the lifespan context manager above.

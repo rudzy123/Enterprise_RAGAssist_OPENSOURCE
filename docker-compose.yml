@@ -1,0 +1,74 @@
+# Enterprise RAG Assistant — production compose stack
+#
+# Quick start:
+#   cp .env.example .env          # set API_KEY + secrets
+#   docker compose build
+#   docker compose --profile ingest run --rm ingest   # one-time indexing
+#   docker compose up -d api
+#
+# With optional Redis cache:
+#   docker compose --profile cache up -d
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enterprise-rag-assistant:latest
+    container_name: enterprise-rag-api
+    restart: unless-stopped
+    ports:
+      - "${UVICORN_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Override Redis URL when cache profile is active
+      REDIS_URL: ${REDIS_URL:-}
+      CACHE_ENABLED: ${CACHE_ENABLED:-false}
+    volumes:
+      - chroma_data:/app/chroma_db
+      - trace_data:/app/traces
+      - log_data:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  # One-shot ingestion job (run manually: docker compose run --rm ingest)
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: enterprise-rag-assistant:latest
+    profiles: ["ingest"]
+    env_file:
+      - .env
+    volumes:
+      - chroma_data:/app/chroma_db
+      - log_data:/app/logs
+    entrypoint: ["python", "ingestion/embed_and_store.py"]
+
+  # Optional Redis for query-embedding cache (enable with --profile cache)
+  redis:
+    image: redis:7-alpine
+    container_name: enterprise-rag-redis
+    restart: unless-stopped
+    profiles: ["cache"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+
+volumes:
+  chroma_data:
+  trace_data:
+  log_data:
+  redis_data:

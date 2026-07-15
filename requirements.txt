@@ -1,11 +1,15 @@
-fastapi>=0.115.0,<0.116.0
-uvicorn>=0.32.0,<0.33.0
-pydantic>=2.9.0,<3.0.0
-python-dotenv>=1.0.0,<2.0.0
-chromadb>=0.5.0,<0.6.0
-sentence-transformers>=3.0.0,<4.0.0
-openai>=1.50.0,<2.0.0
-streamlit>=1.39.0,<2.0.0
-slowapi>=0.1.9,<0.2.0
-httpx>=0.27.0,<0.28.0
-rank-bm25>=0.2.2,<0.3.0
+# Production dependencies — pinned for reproducible builds.
+# Regenerate: pip freeze | grep -E '^(fastapi|uvicorn|...)'
+
+fastapi==0.115.14
+uvicorn[standard]==0.32.1
+pydantic==2.13.4
+python-dotenv==1.2.2
+chromadb==0.5.23
+sentence-transformers==3.4.1
+openai==1.109.1
+streamlit==1.59.2
+slowapi==0.1.10
+httpx==0.27.2
+rank-bm25==0.2.2
+redis==5.2.1
