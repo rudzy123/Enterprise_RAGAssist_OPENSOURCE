@@ -2,7 +2,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from observability.logging_config import JsonFormatter, configure_logging, setup_json_logger
@@ -174,7 +174,7 @@ class TraceStore:
 
 def build_step_log(event: str, details: dict = None) -> dict:
     return {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(UTC).isoformat() + "Z",
         "event": event,
         "details": details or {},
     }

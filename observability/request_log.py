@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -42,7 +42,7 @@ class RequestLogger:
 
     trace_id: str
     query: str
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat() + "Z")
     retrieved_chunks: List[dict] = field(default_factory=list)
     llm_prompt: Optional[dict] = None
     model_response: Optional[str] = None
