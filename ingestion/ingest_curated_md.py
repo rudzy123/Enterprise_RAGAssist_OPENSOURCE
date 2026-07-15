@@ -4,6 +4,18 @@ from typing import Optional
 
 from core.config import CHUNK_OVERLAP_WORDS, CHUNK_WORD_LIMIT, CURATED_DOCS_DIR
 
+
+def infer_doc_type(filename: str) -> str:
+    """Infer a coarse document type from the source filename."""
+    name = filename.lower()
+    if "runbook" in name:
+        return "runbook"
+    if "policy" in name:
+        return "policy"
+    if name.startswith("nist_"):
+        return "nist_reference"
+    return "curated_md"
+
 def split_text_into_chunks(text: str, max_words: int = CHUNK_WORD_LIMIT, overlap_words: int = CHUNK_OVERLAP_WORDS):
     words = text.split()
     if len(words) <= max_words:
@@ -93,6 +105,7 @@ def ingest_curated_markdown(docs_dir: Optional[Path] = None):
                 chunk = {
                     "source_file": md_file.name,
                     "section_title": section_title,
+                    "doc_type": infer_doc_type(md_file.name),
                     "text": chunk_text,
                     "chunk_id": f"{md_file.stem}_{idx}_{part_index}"
                 }

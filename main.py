@@ -17,6 +17,7 @@ from core.config import (
     API_KEY,
     DEBUG_MODE,
     FINAL_K,
+    HYBRID_SEARCH,
     MAX_FINAL_K,
     MAX_QUESTION_LENGTH,
     MIN_CHUNK_SIMILARITY,
@@ -211,12 +212,23 @@ def ask(
     request: Request,
     question: Question,
     final_k: int = Query(default=FINAL_K, ge=1, le=MAX_FINAL_K),
+    hybrid_search: Optional[bool] = Query(default=None, description="Enable dense+BM25 RRF fusion"),
+    source_file: Optional[str] = Query(default=None, description="Filter by source_file metadata"),
+    doc_type: Optional[str] = Query(default=None, description="Filter by doc_type metadata"),
 ):
     """
     Answer questions using retrieved evidence only.
     Confidence is based on retrieval quality (similarity scores, document count, source consolidation).
     Refuse to answer when confidence is low.
     """
+    metadata_filters = {}
+    if source_file:
+        metadata_filters["source_file"] = source_file
+    if doc_type:
+        metadata_filters["doc_type"] = doc_type
+
+    use_hybrid = HYBRID_SEARCH if hybrid_search is None else hybrid_search
+
     trace_id = str(uuid.uuid4())
     started_at = datetime.utcnow()
     request_log = RequestLogger(trace_id=trace_id, query=question.question)
@@ -224,12 +236,22 @@ def ask(
     request_log.log_query(question.question)
 
     retrieval_started = time.perf_counter()
-    request_log.add_step("retrieval_started", {"retrieve_k": RETRIEVE_K, "final_k": final_k})
+    request_log.add_step(
+        "retrieval_started",
+        {
+            "retrieve_k": RETRIEVE_K,
+            "final_k": final_k,
+            "hybrid_search": use_hybrid,
+            "metadata_filters": metadata_filters or None,
+        },
+    )
 
     retrieval = retrieve_similar_chunks(
         question.question,
         retrieve_k=RETRIEVE_K,
         final_k=final_k,
+        hybrid_search=use_hybrid,
+        metadata_filters=metadata_filters or None,
         return_trace=True,
         trace_id=trace_id,
     )
@@ -251,9 +273,11 @@ def ask(
             "raw_candidate_count": len(raw_candidates),
             "filtered_count": len(filtered_chunks),
             "rerank_enabled": retrieval.get("rerank_enabled", False),
+            "hybrid_search": retrieval.get("hybrid_search", False),
             "top_similarity": top_similarity,
             "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
             "max_chunks_per_file": retrieval["max_chunks_per_file"],
+            "metadata_filters": retrieval.get("metadata_filters"),
         },
     )
     request_log.add_step("relevance_scored", {"top_similarity": top_similarity})

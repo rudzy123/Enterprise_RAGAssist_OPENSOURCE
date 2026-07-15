@@ -126,21 +126,43 @@ python -c "from ingestion.pipeline import ingest_corpus; ingest_corpus(verbose=T
 
 ### Retrieval pipeline (`retrieval/retrieve_chunks.py`)
 
+**Dense-only (default, `HYBRID_SEARCH=false`):**
+
 | Stage | Default | Purpose |
 |-------|---------|---------|
 | Bi-encoder search | `retrieve_k = 15` | Fetch vector candidates from Chroma |
-| Similarity filter | `min_similarity ≥ 0.40` | Drop weak matches (no fallback) |
+| Similarity filter | `min_similarity ≥ 0.40` | Drop weak dense matches |
 | Cross-encoder rerank | `rerank_top_n = 15` | Rescore query–passage pairs |
 | Per-document cap | `max 2 per file` | Reduce single-doc dominance |
 | Final selection | `final_k = 3` | Chunks passed to generation |
 
+**Hybrid mode (`HYBRID_SEARCH=true`):**
+
+| Stage | Default | Purpose |
+|-------|---------|---------|
+| Dense search | `retrieve_k = 15` | Chroma bi-encoder candidates |
+| Sparse search | `bm25_retrieve_k = 15` | BM25 candidates via `rank_bm25` |
+| Weighted RRF fusion | `alpha = 0.7` | `score = α/(k+rank_dense) + (1-α)/(k+rank_sparse)` |
+| Threshold filter | dense ≥ 0.40 **or** BM25 ≥ 0.30 | Keeps keyword-strong matches |
+| Cross-encoder rerank | optional | Same reranker as dense-only |
+| Per-document cap + final_k | unchanged | Same downstream pipeline |
+
+Metadata filtering is supported on both legs via `source_file`, `doc_type`, and `section_title`.
+
 ### API response (`POST /ask`)
 
 ```bash
+# Dense-only (default)
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" \
   -d '{"question": "What is the incident response process?"}'
+
+# Hybrid + metadata filter
+curl -X POST "http://localhost:8000/ask?hybrid_search=true&doc_type=policy" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"question": "What is least privilege?"}'
 ```
 
 ```json
@@ -180,6 +202,13 @@ streamlit run app/app.py
 
 # Evaluation
 PYTHONPATH=. python evals/run_evals.py -v
+
+# Hybrid eval (requires re-ingest after enabling hybrid)
+HYBRID_SEARCH=true python ingestion/embed_and_store.py
+PYTHONPATH=. python evals/run_evals.py --hybrid -v
+
+# Hybrid eval scoped to policies only
+PYTHONPATH=. python evals/run_evals.py --hybrid --doc-type policy -v
 ```
 
 ### Health checks
@@ -208,6 +237,11 @@ Loaded from `.env` via `core/config.py` (`python-dotenv`).
 | `MIN_SIMILARITY_THRESHOLD` | `0.35` | Relevance gate before answering |
 | `LOW_CONFIDENCE_THRESHOLD` | `0.30` | Abstention threshold |
 | `RERANK_ENABLED` | `true` | Cross-encoder reranking |
+| `HYBRID_SEARCH` | `false` | Enable dense+BM25 hybrid retrieval |
+| `HYBRID_ALPHA` / `ALPHA` | `0.7` | Dense weight in weighted RRF |
+| `BM25_RETRIEVE_K` | `15` | BM25 candidate count |
+| `RRF_K` | `60` | RRF rank smoothing constant |
+| `BM25_MIN_SCORE` | `0.30` | Normalized BM25 threshold in hybrid mode |
 | `OPENAI_MODEL` | `gpt-3.5-turbo` | Generation model |
 | `NOT_FOUND_ANSWER` | `Not found` | Abstention text |
 | `DEBUG_MODE` | `false` | FastAPI debug mode |
@@ -229,7 +263,11 @@ Enterprise_Rag_Assistant/
 │   ├── ingest_curated_md.py    # Section-aware Markdown chunking
 │   ├── pipeline.py             # Canonical ingest_corpus()
 │   └── embed_and_store.py      # CLI wrapper
-├── retrieval/                  # Search, rerank, structured logs
+├── retrieval/                  # Search, rerank, BM25, RRF, structured logs
+│   ├── retrieve_chunks.py      # Dense + optional hybrid retrieval
+│   ├── bm25_store.py           # BM25 index build/load/search
+│   ├── hybrid.py               # Weighted Reciprocal Rank Fusion
+│   └── metadata_filter.py      # Chroma where + in-memory filters
 ├── answer_generation/          # Prompts, citations, confidence gating
 ├── observability/              # RequestLogger, SQLite traces
 ├── evals/                      # questions.jsonl, run_evals.py, metrics
@@ -245,7 +283,7 @@ Enterprise_Rag_Assistant/
 
 | Area | Limitation |
 |------|------------|
-| **Retrieval** | Pure dense retrieval only—no BM25/hybrid search |
+| **Retrieval** | Hybrid search is opt-in; re-ingest required to build BM25 index |
 | **Auth** | Single shared API key (no RBAC or per-tenant keys) |
 | **Scale** | Small curated corpus (~4 docs); Chroma local-only |
 | **Traces** | May contain full prompts and document excerpts |

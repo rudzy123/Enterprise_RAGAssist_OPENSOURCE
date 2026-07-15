@@ -41,6 +41,14 @@ RETRIEVAL_STRUCTURED_LOGS = os.getenv("RETRIEVAL_STRUCTURED_LOGS", "true").lower
     "yes",
 )
 
+# Hybrid search (dense + BM25 via weighted RRF)
+HYBRID_SEARCH = os.getenv("HYBRID_SEARCH", "false").lower() in ("1", "true", "yes")
+HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", os.getenv("ALPHA", "0.7")))
+BM25_RETRIEVE_K = int(os.getenv("BM25_RETRIEVE_K", "15"))
+RRF_K = int(os.getenv("RRF_K", "60"))
+BM25_MIN_SCORE = float(os.getenv("BM25_MIN_SCORE", "0.30"))
+BM25_INDEX_DIR = BASE_DIR / os.getenv("BM25_INDEX_DIR", "chroma_db/bm25")
+
 # Ingestion / chunking
 CHUNK_WORD_LIMIT = int(os.getenv("CHUNK_WORD_LIMIT", "250"))
 CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "50"))

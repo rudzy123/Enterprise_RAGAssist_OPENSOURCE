@@ -44,6 +44,9 @@ def evaluate_question(
     min_similarity: float,
     retrieve_k: int,
     rerank_enabled: bool,
+    hybrid_search: bool,
+    hybrid_alpha: float | None,
+    metadata_filters: dict | None,
     use_llm: bool,
     verbose: bool,
 ) -> dict:
@@ -56,6 +59,9 @@ def evaluate_question(
         final_k=final_k,
         min_similarity=min_similarity,
         rerank_enabled=rerank_enabled,
+        hybrid_search=hybrid_search,
+        hybrid_alpha=hybrid_alpha,
+        metadata_filters=metadata_filters,
         return_trace=True,
         structured_logs=False,
     )
@@ -114,6 +120,9 @@ def evaluate_question(
             "min_chunk_similarity": min_similarity,
             "retrieve_k": retrieve_k,
             "rerank_enabled": rerank_enabled,
+            "hybrid_search": trace.get("hybrid_search", False),
+            "hybrid_alpha": trace.get("hybrid_alpha"),
+            "metadata_filters": trace.get("metadata_filters"),
             "use_llm": use_llm,
         },
     }
@@ -126,6 +135,9 @@ def run_single_config(
     min_similarity: float,
     retrieve_k: int,
     rerank_enabled: bool,
+    hybrid_search: bool,
+    hybrid_alpha: float | None,
+    metadata_filters: dict | None,
     use_llm: bool,
     verbose: bool,
 ) -> dict:
@@ -136,6 +148,9 @@ def run_single_config(
             min_similarity=min_similarity,
             retrieve_k=retrieve_k,
             rerank_enabled=rerank_enabled,
+            hybrid_search=hybrid_search,
+            hybrid_alpha=hybrid_alpha,
+            metadata_filters=metadata_filters,
             use_llm=use_llm,
             verbose=verbose,
         )
@@ -147,6 +162,9 @@ def run_single_config(
         "min_chunk_similarity": min_similarity,
         "retrieve_k": retrieve_k,
         "rerank_enabled": rerank_enabled,
+        "hybrid_search": hybrid_search,
+        "hybrid_alpha": hybrid_alpha,
+        "metadata_filters": metadata_filters,
         "use_llm": use_llm,
     }
     return {
@@ -178,6 +196,9 @@ def run_parameter_sweep(
     min_similarity_values: list[float],
     retrieve_k: int,
     rerank_enabled: bool,
+    hybrid_search: bool,
+    hybrid_alpha: float | None,
+    metadata_filters: dict | None,
     use_llm: bool,
     verbose: bool,
 ) -> dict:
@@ -198,6 +219,9 @@ def run_parameter_sweep(
                 min_similarity=min_similarity,
                 retrieve_k=retrieve_k,
                 rerank_enabled=rerank_enabled,
+                hybrid_search=hybrid_search,
+                hybrid_alpha=hybrid_alpha,
+                metadata_filters=metadata_filters,
                 use_llm=use_llm,
                 verbose=verbose,
             )
@@ -264,6 +288,40 @@ def main():
         help="Disable cross-encoder reranking during eval",
     )
     parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="Enable dense+BM25 hybrid retrieval with weighted RRF",
+    )
+    parser.add_argument(
+        "--no-hybrid",
+        action="store_true",
+        help="Force dense-only retrieval even if HYBRID_SEARCH=true",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Dense weight for weighted RRF (default: HYBRID_ALPHA config)",
+    )
+    parser.add_argument(
+        "--metadata-filter",
+        type=str,
+        default=None,
+        help='JSON metadata filters, e.g. \'{"doc_type":"policy"}\'',
+    )
+    parser.add_argument(
+        "--source-file",
+        type=str,
+        default=None,
+        help="Shortcut metadata filter for source_file",
+    )
+    parser.add_argument(
+        "--doc-type",
+        type=str,
+        default=None,
+        help="Shortcut metadata filter for doc_type",
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help="Use retrieval-only answer generation (no OpenAI)",
@@ -300,6 +358,30 @@ def main():
     if not args.no_llm and not use_llm:
         print("No OPENAI_API_KEY set — using retrieval-only answer generation.")
 
+    from config import FINAL_K, HYBRID_SEARCH, MIN_CHUNK_SIMILARITY
+
+    if args.hybrid and args.no_hybrid:
+        print("Error: --hybrid and --no-hybrid are mutually exclusive.")
+        sys.exit(1)
+
+    if args.hybrid:
+        hybrid_search = True
+    elif args.no_hybrid:
+        hybrid_search = False
+    else:
+        hybrid_search = HYBRID_SEARCH
+
+    metadata_filters = None
+    if args.metadata_filter:
+        metadata_filters = json.loads(args.metadata_filter)
+    else:
+        metadata_filters = {}
+        if args.source_file:
+            metadata_filters["source_file"] = args.source_file
+        if args.doc_type:
+            metadata_filters["doc_type"] = args.doc_type
+        metadata_filters = metadata_filters or None
+
     if args.sweep:
         final_k_values = [int(x.strip()) for x in args.final_k_values.split(",") if x.strip()]
         min_similarity_values = [
@@ -311,6 +393,9 @@ def main():
             min_similarity_values=min_similarity_values,
             retrieve_k=args.retrieve_k,
             rerank_enabled=rerank_enabled,
+            hybrid_search=hybrid_search,
+            hybrid_alpha=args.alpha,
+            metadata_filters=metadata_filters,
             use_llm=use_llm,
             verbose=args.verbose,
         )
@@ -321,8 +406,6 @@ def main():
         print_summary(payload["best_summary"])
         ts_path, latest_path = save_results(payload, prefix="sweep_results")
     else:
-        from config import FINAL_K, MIN_CHUNK_SIMILARITY
-
         final_k = args.final_k if args.final_k is not None else FINAL_K
         min_similarity = (
             args.min_similarity if args.min_similarity is not None else MIN_CHUNK_SIMILARITY
@@ -330,7 +413,8 @@ def main():
 
         print(
             f"\nConfig: final_k={final_k}, min_similarity={min_similarity}, "
-            f"rerank={rerank_enabled}, use_llm={use_llm}"
+            f"rerank={rerank_enabled}, hybrid={hybrid_search}, "
+            f"alpha={args.alpha}, metadata_filters={metadata_filters}, use_llm={use_llm}"
         )
         print("=" * 80)
 
@@ -340,6 +424,9 @@ def main():
             min_similarity=min_similarity,
             retrieve_k=args.retrieve_k,
             rerank_enabled=rerank_enabled,
+            hybrid_search=hybrid_search,
+            hybrid_alpha=args.alpha,
+            metadata_filters=metadata_filters,
             use_llm=use_llm,
             verbose=args.verbose,
         )
