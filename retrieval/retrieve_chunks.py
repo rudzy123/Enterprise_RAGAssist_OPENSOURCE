@@ -11,10 +11,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional, Union
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-from config import (
+from core.config import (
+    CHROMA_COLLECTION_NAME,
     FINAL_K,
     MAX_CHUNKS_PER_FILE,
     MIN_CHUNK_SIMILARITY,
@@ -24,18 +22,16 @@ from config import (
     RETRIEVE_K,
     RETRIEVAL_STRUCTURED_LOGS,
 )
+from core.embeddings import encode_query
+from core.vector_store import get_collection
 from observability import setup_json_logger
 from retrieval.rerank import rerank_chunks
 from retrieval.similarity import cosine_similarity_from_distance
 from retrieval.result_format import enrich_retrieved_chunks
 from retrieval.structured_logs import log_retrieval_pipeline
 
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-COLLECTION_NAME = "enterprise_docs"
-CHROMA_PATH = "./chroma_db"
+COLLECTION_NAME = CHROMA_COLLECTION_NAME
 
-_embedding_model: Optional[SentenceTransformer] = None
-_chroma_client: Optional[chromadb.PersistentClient] = None
 _retrieval_logger: Optional[logging.Logger] = None
 
 
@@ -44,20 +40,6 @@ def _get_retrieval_logger() -> logging.Logger:
     if _retrieval_logger is None:
         _retrieval_logger = setup_json_logger("enterprise_rag.retrieval")
     return _retrieval_logger
-
-
-def _get_embedding_model() -> SentenceTransformer:
-    global _embedding_model
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    return _embedding_model
-
-
-def _get_chroma_client() -> chromadb.PersistentClient:
-    global _chroma_client
-    if _chroma_client is None:
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return _chroma_client
 
 
 def _apply_per_document_cap(chunks: List[dict], max_per_file: int) -> List[dict]:
@@ -113,8 +95,7 @@ def retrieve_similar_chunks(
         final_k = top_k
 
     try:
-        client = _get_chroma_client()
-        collection = client.get_collection(name=collection_name)
+        collection = get_collection(collection_name, create_if_missing=False)
     except Exception as e:
         if verbose:
             print(f"Error connecting to Chroma: {e}")
@@ -123,8 +104,7 @@ def retrieve_similar_chunks(
         )
         return empty
 
-    model = _get_embedding_model()
-    query_embedding = model.encode(query)
+    query_embedding = encode_query(query)
 
     n_results = min(retrieve_k, max(collection.count(), 1))
 

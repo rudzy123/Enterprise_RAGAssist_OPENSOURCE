@@ -1,9 +1,8 @@
-import os
 import re
 from pathlib import Path
-from config import CHUNK_OVERLAP_WORDS, CHUNK_WORD_LIMIT
+from typing import Optional
 
-CURATED_DIR = Path("data/docs/curated")
+from core.config import CHUNK_OVERLAP_WORDS, CHUNK_WORD_LIMIT, CURATED_DOCS_DIR
 
 def split_text_into_chunks(text: str, max_words: int = CHUNK_WORD_LIMIT, overlap_words: int = CHUNK_OVERLAP_WORDS):
     words = text.split()
@@ -74,10 +73,11 @@ def split_markdown_sections(text: str):
     return sections
 
 
-def ingest_curated_markdown():
+def ingest_curated_markdown(docs_dir: Optional[Path] = None):
     all_chunks = []
+    curated_dir = docs_dir or CURATED_DOCS_DIR
 
-    for md_file in CURATED_DIR.glob("*.md"):
+    for md_file in curated_dir.glob("*.md"):
         with open(md_file, "r", encoding="utf-8") as f:
             text = f.read()
 
