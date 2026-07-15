@@ -149,16 +149,51 @@ python -c "from ingestion.pipeline import ingest_corpus; ingest_corpus(verbose=T
 
 Metadata filtering is supported on both legs via `source_file`, `doc_type`, and `section_title`.
 
+### Hybrid smoke test
+
+After ingesting (builds Chroma **and** BM25 index):
+
+```bash
+python ingestion/embed_and_store.py
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+```bash
+# Keyword-heavy query — hybrid helps match exact control IDs / policy terms
+curl -s -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "question": "What does AC-2 require for account management?",
+    "hybrid_search": true,
+    "metadata_filters": {"doc_type": "nist_reference"}
+  }' | python3 -m json.tool
+```
+
+Expected: `retrieved_chunks` with NIST sources, a `trace_id`, and (in server logs) `hybrid_fusion_completed` with `fusion_mode: "rrf"`.
+
+Dense-only behavior is unchanged when `hybrid_search` is omitted or `false`.
+
 ### API response (`POST /ask`)
 
 ```bash
-# Dense-only (default)
+# Dense-only (default — backward compatible)
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" \
   -d '{"question": "What is the incident response process?"}'
 
-# Hybrid + metadata filter
+# Hybrid with metadata_filters in request body
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "question": "What is least privilege?",
+    "hybrid_search": true,
+    "metadata_filters": {"doc_type": "policy"}
+  }'
+
+# Query-param shortcuts (merged with body filters; body wins on conflict)
 curl -X POST "http://localhost:8000/ask?hybrid_search=true&doc_type=policy" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" \

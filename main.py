@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -31,6 +31,7 @@ from core.vector_store import collection_count
 from answer_generation.generation import generate_answer_from_chunks
 from ingestion.pipeline import ingest_corpus
 from retrieval.retrieve_chunks import retrieve_similar_chunks
+from retrieval.metadata_filter import merge_metadata_filters
 from retrieval.similarity import chunk_similarity_score, max_similarity
 from observability import TraceStore, log_event, setup_json_logger
 from observability.request_log import RequestLogger
@@ -61,6 +62,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LENGTH)
+    hybrid_search: Optional[bool] = Field(
+        default=None,
+        description="Enable dense+BM25 hybrid retrieval. Defaults to HYBRID_SEARCH env (false).",
+    )
+    metadata_filters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description='Optional metadata filters, e.g. {"doc_type": "policy", "source_file": "access_control_policy.md"}',
+    )
 
 
 class RetrievedChunk(BaseModel):
@@ -212,22 +221,57 @@ def ask(
     request: Request,
     question: Question,
     final_k: int = Query(default=FINAL_K, ge=1, le=MAX_FINAL_K),
-    hybrid_search: Optional[bool] = Query(default=None, description="Enable dense+BM25 RRF fusion"),
-    source_file: Optional[str] = Query(default=None, description="Filter by source_file metadata"),
-    doc_type: Optional[str] = Query(default=None, description="Filter by doc_type metadata"),
+    hybrid_search: Optional[bool] = Query(
+        default=None,
+        description="Query-param override for hybrid retrieval (body field takes precedence when both set)",
+    ),
+    source_file: Optional[str] = Query(
+        default=None,
+        description="Shortcut metadata filter for source_file",
+    ),
+    doc_type: Optional[str] = Query(
+        default=None,
+        description="Shortcut metadata filter for doc_type",
+    ),
+    section_title: Optional[str] = Query(
+        default=None,
+        description="Shortcut metadata filter for section_title",
+    ),
 ):
     """
     Answer questions using retrieved evidence only.
     Confidence is based on retrieval quality (similarity scores, document count, source consolidation).
     Refuse to answer when confidence is low.
-    """
-    metadata_filters = {}
-    if source_file:
-        metadata_filters["source_file"] = source_file
-    if doc_type:
-        metadata_filters["doc_type"] = doc_type
 
-    use_hybrid = HYBRID_SEARCH if hybrid_search is None else hybrid_search
+    Hybrid search is off by default. Enable per-request via `hybrid_search: true` in the
+    JSON body or `?hybrid_search=true` query param (requires BM25 index from ingestion).
+
+    Metadata filters may be supplied in the request body as `metadata_filters` and/or via
+    query-param shortcuts (`source_file`, `doc_type`, `section_title`).
+    """
+    try:
+        metadata_filters = merge_metadata_filters(
+            question.metadata_filters,
+            {
+                k: v
+                for k, v in {
+                    "source_file": source_file,
+                    "doc_type": doc_type,
+                    "section_title": section_title,
+                }.items()
+                if v
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Body field wins over query param when both are provided.
+    if question.hybrid_search is not None:
+        use_hybrid = question.hybrid_search
+    elif hybrid_search is not None:
+        use_hybrid = hybrid_search
+    else:
+        use_hybrid = HYBRID_SEARCH
 
     trace_id = str(uuid.uuid4())
     started_at = datetime.utcnow()
@@ -242,19 +286,22 @@ def ask(
             "retrieve_k": RETRIEVE_K,
             "final_k": final_k,
             "hybrid_search": use_hybrid,
-            "metadata_filters": metadata_filters or None,
+            "metadata_filters": metadata_filters,
         },
     )
 
-    retrieval = retrieve_similar_chunks(
-        question.question,
-        retrieve_k=RETRIEVE_K,
-        final_k=final_k,
-        hybrid_search=use_hybrid,
-        metadata_filters=metadata_filters or None,
-        return_trace=True,
-        trace_id=trace_id,
-    )
+    try:
+        retrieval = retrieve_similar_chunks(
+            question.question,
+            retrieve_k=RETRIEVE_K,
+            final_k=final_k,
+            hybrid_search=use_hybrid,
+            metadata_filters=metadata_filters,
+            return_trace=True,
+            trace_id=trace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     retrieval_latency_ms = (time.perf_counter() - retrieval_started) * 1000.0
     filtered_chunks = retrieval["chunks"]
@@ -274,6 +321,8 @@ def ask(
             "filtered_count": len(filtered_chunks),
             "rerank_enabled": retrieval.get("rerank_enabled", False),
             "hybrid_search": retrieval.get("hybrid_search", False),
+            "fusion_mode": (retrieval.get("fusion_stats") or {}).get("fusion_mode"),
+            "retrieval_warnings": retrieval.get("warnings", []),
             "top_similarity": top_similarity,
             "min_similarity_threshold": MIN_CHUNK_SIMILARITY,
             "max_chunks_per_file": retrieval["max_chunks_per_file"],

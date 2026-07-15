@@ -1,5 +1,8 @@
 """
 Metadata filtering helpers for dense (Chroma) and sparse (BM25) retrieval.
+
+Supported filter fields: source_file, doc_type, section_title.
+Values may be a scalar or a list (interpreted as OR / $in).
 """
 
 from __future__ import annotations
@@ -17,10 +20,30 @@ FILTERABLE_METADATA_FIELDS = frozenset(
 )
 
 
+def _coerce_filter_value(value: Any) -> FilterValue:
+    """Normalize a single filter value from API / env input."""
+    if isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, list):
+        cleaned = [item for item in value if item is not None and item != ""]
+        if not cleaned:
+            raise ValueError("Metadata filter list cannot be empty.")
+        return cleaned
+    raise ValueError(
+        f"Unsupported metadata filter value type: {type(value).__name__}. "
+        "Use a string, number, or list of strings."
+    )
+
+
 def normalize_metadata_filters(
-    metadata_filters: Optional[Dict[str, FilterValue]],
+    metadata_filters: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, FilterValue]]:
-    """Validate and normalize metadata filter keys."""
+    """
+    Validate and normalize metadata filter keys and values.
+
+    Returns None when no effective filters remain.
+    Raises ValueError for unknown keys or invalid value types.
+    """
     if not metadata_filters:
         return None
 
@@ -33,11 +56,25 @@ def normalize_metadata_filters(
             )
         if value is None or value == "":
             continue
-        if isinstance(value, list) and not value:
-            continue
-        normalized[key] = value
+        normalized[key] = _coerce_filter_value(value)
 
     return normalized or None
+
+
+def merge_metadata_filters(
+    *filter_dicts: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, FilterValue]]:
+    """
+    Merge multiple filter dicts left-to-right; later values override earlier ones.
+
+    Query-param shortcuts (e.g. source_file=...) can be merged with a body
+    metadata_filters dict. Invalid keys raise ValueError.
+    """
+    merged: Dict[str, Any] = {}
+    for filters in filter_dicts:
+        if filters:
+            merged.update(filters)
+    return normalize_metadata_filters(merged)
 
 
 def build_chroma_where(metadata_filters: Optional[Dict[str, FilterValue]]) -> Optional[dict]:
@@ -51,7 +88,8 @@ def build_chroma_where(metadata_filters: Optional[Dict[str, FilterValue]]) -> Op
         if isinstance(value, list):
             clauses.append({key: {"$in": value}})
         else:
-            clauses.append({key: value})
+            # Explicit $eq improves compatibility across Chroma versions.
+            clauses.append({key: {"$eq": value}})
 
     if len(clauses) == 1:
         return clauses[0]

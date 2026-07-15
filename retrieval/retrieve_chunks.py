@@ -31,9 +31,9 @@ from core.config import (
 )
 from core.embeddings import encode_query
 from core.vector_store import get_collection
-from observability import setup_json_logger
+from observability import log_event, setup_json_logger
 from retrieval.bm25_store import bm25_search
-from retrieval.hybrid import reciprocal_rank_fusion
+from retrieval.hybrid import fuse_hybrid_candidates
 from retrieval.metadata_filter import build_chroma_where, normalize_metadata_filters
 from retrieval.rerank import rerank_chunks
 from retrieval.similarity import cosine_similarity_from_distance
@@ -50,6 +50,11 @@ def _get_retrieval_logger() -> logging.Logger:
     if _retrieval_logger is None:
         _retrieval_logger = setup_json_logger("enterprise_rag.retrieval")
     return _retrieval_logger
+
+
+def _log_retrieval_event(event: str, *, trace_id: Optional[str] = None, **details: Any) -> None:
+    """Emit a structured retrieval-stage log entry."""
+    log_event(_get_retrieval_logger(), event, trace_id=trace_id, **details)
 
 
 def _apply_per_document_cap(chunks: List[dict], max_per_file: int) -> List[dict]:
@@ -89,12 +94,38 @@ def _dense_search(
     retrieve_k: int,
     collection_name: str,
     metadata_filters: Optional[Dict[str, Any]],
-) -> List[dict]:
-    collection = get_collection(collection_name, create_if_missing=False)
+    trace_id: Optional[str] = None,
+) -> tuple[List[dict], dict]:
+    """
+    Run dense vector retrieval against Chroma.
+
+    Returns:
+        (candidates, search_stats)
+    """
+    stats: dict = {
+        "retrieve_k": retrieve_k,
+        "metadata_filters": metadata_filters,
+        "warnings": [],
+    }
+
+    try:
+        collection = get_collection(collection_name, create_if_missing=False)
+    except Exception as exc:
+        stats["warnings"].append("chroma_collection_unavailable")
+        stats["error"] = str(exc)
+        _log_retrieval_event(
+            "dense_search_failed",
+            trace_id=trace_id,
+            error=str(exc),
+            collection_name=collection_name,
+        )
+        return [], stats
+
     query_embedding = encode_query(query)
     where = build_chroma_where(metadata_filters)
+    collection_count = collection.count()
+    n_results = min(retrieve_k, max(collection_count, 1))
 
-    n_results = min(retrieve_k, max(collection.count(), 1))
     query_kwargs = {
         "query_embeddings": [query_embedding],
         "n_results": n_results,
@@ -103,7 +134,18 @@ def _dense_search(
     if where is not None:
         query_kwargs["where"] = where
 
-    results = collection.query(**query_kwargs)
+    try:
+        results = collection.query(**query_kwargs)
+    except Exception as exc:
+        stats["warnings"].append("chroma_query_failed")
+        stats["error"] = str(exc)
+        _log_retrieval_event(
+            "dense_search_failed",
+            trace_id=trace_id,
+            error=str(exc),
+            where=where,
+        )
+        return [], stats
 
     raw_candidates: List[dict] = []
     for chunk_id, distance, doc, metadata in zip(
@@ -115,7 +157,16 @@ def _dense_search(
         raw_candidates.append(_chunk_from_chroma_row(chunk_id, distance, doc, metadata))
 
     raw_candidates.sort(key=lambda c: c["similarity_score"], reverse=True)
-    return raw_candidates
+    stats["collection_count"] = collection_count
+    stats["returned_count"] = len(raw_candidates)
+    _log_retrieval_event(
+        "dense_search_completed",
+        trace_id=trace_id,
+        returned_count=len(raw_candidates),
+        collection_count=collection_count,
+        metadata_filters=metadata_filters,
+    )
+    return raw_candidates, stats
 
 
 def _apply_retrieval_threshold(
@@ -124,6 +175,12 @@ def _apply_retrieval_threshold(
     min_similarity: float,
     hybrid_search: bool,
 ) -> List[dict]:
+    """
+    Apply post-fusion relevance thresholds.
+
+    Dense-only mode keeps the original cosine-similarity gate.
+    Hybrid mode also admits BM25-strong chunks that may have low dense scores.
+    """
     if hybrid_search:
         return [
             c
@@ -157,6 +214,9 @@ def retrieve_similar_chunks(
     """
     Retrieve chunks using dense search, or hybrid dense+BM25 with weighted RRF.
 
+    Hybrid search is **off by default** (`HYBRID_SEARCH=false`). When disabled,
+    this function behaves identically to the original dense-only implementation.
+
     Args:
         query: Plain text search query
         retrieve_k: Number of dense vector candidates
@@ -183,50 +243,108 @@ def retrieve_similar_chunks(
     if top_k is not None:
         final_k = top_k
 
+    # Default-off hybrid preserves backward compatibility for all existing callers.
     use_hybrid = HYBRID_SEARCH if hybrid_search is None else hybrid_search
     alpha = HYBRID_ALPHA if hybrid_alpha is None else hybrid_alpha
     sparse_k = BM25_RETRIEVE_K if bm25_retrieve_k is None else bm25_retrieve_k
     rrf_constant = RRF_K if rrf_k is None else rrf_k
 
+    retrieval_warnings: List[str] = []
+    dense_stats: dict = {}
+    sparse_stats: dict = {}
+    fusion_stats: dict = {}
+
     try:
         filters = normalize_metadata_filters(metadata_filters)
-    except ValueError as exc:
+    except ValueError:
+        # Propagate invalid filters to API callers; CLI callers get an empty result.
         if return_trace:
             raise
-        if verbose:
-            print(f"Invalid metadata filters: {exc}")
+        _log_retrieval_event(
+            "retrieval_invalid_metadata_filters",
+            trace_id=trace_id,
+            metadata_filters=metadata_filters,
+        )
         return []
 
     dense_candidates: List[dict] = []
     sparse_candidates: List[dict] = []
     raw_candidates: List[dict] = []
 
-    try:
-        dense_candidates = _dense_search(
-            query,
-            retrieve_k=retrieve_k,
-            collection_name=collection_name,
-            metadata_filters=filters,
-        )
+    _log_retrieval_event(
+        "retrieval_started",
+        trace_id=trace_id,
+        hybrid_search=use_hybrid,
+        hybrid_alpha=alpha,
+        retrieve_k=retrieve_k,
+        bm25_retrieve_k=sparse_k,
+        metadata_filters=filters,
+    )
 
-        if use_hybrid:
-            sparse_candidates = bm25_search(
+    # --- Dense leg (always executed) ---
+    dense_candidates, dense_stats = _dense_search(
+        query,
+        retrieve_k=retrieve_k,
+        collection_name=collection_name,
+        metadata_filters=filters,
+        trace_id=trace_id,
+    )
+    retrieval_warnings.extend(dense_stats.get("warnings", []))
+
+    # --- Sparse + fusion leg (hybrid only) ---
+    if use_hybrid:
+        try:
+            sparse_candidates, sparse_stats = bm25_search(
                 query,
                 top_k=sparse_k,
                 collection_name=collection_name,
                 metadata_filters=filters,
             )
-            raw_candidates = reciprocal_rank_fusion(
-                [dense_candidates, sparse_candidates],
-                weights=[alpha, 1.0 - alpha],
+            retrieval_warnings.extend(sparse_stats.get("warnings", []))
+
+            if not sparse_stats.get("index_available", True):
+                retrieval_warnings.append("hybrid_degraded_to_dense_only")
+
+            raw_candidates, fusion_stats = fuse_hybrid_candidates(
+                dense_candidates,
+                sparse_candidates,
+                alpha=alpha,
                 rrf_k=rrf_constant,
             )
-        else:
-            raw_candidates = dense_candidates
+            retrieval_warnings.extend(fusion_stats.get("warnings", []))
 
-    except Exception as e:
-        if verbose:
-            print(f"Error during retrieval: {e}")
+            _log_retrieval_event(
+                "hybrid_fusion_completed",
+                trace_id=trace_id,
+                fusion_mode=fusion_stats.get("fusion_mode"),
+                dense_count=fusion_stats.get("dense_count"),
+                sparse_count=fusion_stats.get("sparse_count"),
+                fused_count=fusion_stats.get("fused_count"),
+                warnings=fusion_stats.get("warnings"),
+            )
+        except ValueError as exc:
+            # Invalid alpha or RRF configuration — fall back to dense ordering.
+            retrieval_warnings.append("hybrid_fusion_failed")
+            raw_candidates = list(dense_candidates)
+            fusion_stats = {"fusion_mode": "dense_fallback", "error": str(exc)}
+            _log_retrieval_event(
+                "hybrid_fusion_failed",
+                trace_id=trace_id,
+                error=str(exc),
+            )
+        except Exception as exc:
+            retrieval_warnings.append("hybrid_sparse_leg_failed")
+            raw_candidates = list(dense_candidates)
+            fusion_stats = {"fusion_mode": "dense_fallback", "error": str(exc)}
+            _log_retrieval_event(
+                "hybrid_sparse_leg_failed",
+                trace_id=trace_id,
+                error=str(exc),
+            )
+    else:
+        raw_candidates = dense_candidates
+
+    if not raw_candidates and dense_stats.get("error"):
         empty = [] if not return_trace else _empty_trace(
             retrieve_k=retrieve_k,
             final_k=final_k,
@@ -238,6 +356,7 @@ def retrieve_similar_chunks(
             bm25_retrieve_k=sparse_k,
             rrf_k=rrf_constant,
             metadata_filters=filters,
+            warnings=retrieval_warnings,
         )
         return empty
 
@@ -247,9 +366,17 @@ def retrieve_similar_chunks(
         hybrid_search=use_hybrid,
     )
 
+    if use_hybrid and not threshold_passed and raw_candidates:
+        retrieval_warnings.append("hybrid_threshold_filtered_all_candidates")
+
     rerank_input = threshold_passed[:rerank_top_n]
     if rerank_enabled and rerank_input:
-        reranked = rerank_chunks(query, rerank_input)
+        try:
+            reranked = rerank_chunks(query, rerank_input)
+        except Exception as exc:
+            retrieval_warnings.append("rerank_failed")
+            reranked = list(rerank_input)
+            _log_retrieval_event("rerank_failed", trace_id=trace_id, error=str(exc))
     else:
         reranked = list(rerank_input)
 
@@ -273,15 +400,28 @@ def retrieve_similar_chunks(
             final_chunks=final_chunks,
         )
 
+    _log_retrieval_event(
+        "retrieval_completed",
+        trace_id=trace_id,
+        hybrid_search=use_hybrid,
+        raw_candidate_count=len(raw_candidates),
+        threshold_passed_count=len(threshold_passed),
+        final_count=len(final_chunks),
+        warnings=retrieval_warnings,
+    )
+
     if verbose:
         print(f"\nHybrid search: {use_hybrid}")
         if use_hybrid:
             print(f"Dense candidates: {len(dense_candidates)}")
             print(f"BM25 candidates: {len(sparse_candidates)}")
+            print(f"Fusion mode: {fusion_stats.get('fusion_mode', 'n/a')}")
             print(f"RRF alpha (dense weight): {alpha}")
         print(f"Fused/raw candidates: {len(raw_candidates)}")
         if filters:
             print(f"Metadata filters: {filters}")
+        if retrieval_warnings:
+            print(f"Warnings: {retrieval_warnings}")
         print(f"Above threshold: {len(threshold_passed)}")
         print(f"Rerank enabled: {rerank_enabled} ({len(rerank_input)} scored)")
         print(f"After per-file cap ({max_chunks_per_file}): {len(capped)}")
@@ -317,6 +457,10 @@ def retrieve_similar_chunks(
             "bm25_retrieve_k": sparse_k,
             "rrf_k": rrf_constant,
             "metadata_filters": filters,
+            "dense_stats": dense_stats,
+            "sparse_stats": sparse_stats,
+            "fusion_stats": fusion_stats,
+            "warnings": retrieval_warnings,
         }
 
     return final_chunks
@@ -334,6 +478,7 @@ def _empty_trace(
     bm25_retrieve_k: int = BM25_RETRIEVE_K,
     rrf_k: int = RRF_K,
     metadata_filters: Optional[dict] = None,
+    warnings: Optional[List[str]] = None,
 ) -> dict:
     return {
         "chunks": [],
@@ -355,6 +500,10 @@ def _empty_trace(
         "bm25_retrieve_k": bm25_retrieve_k,
         "rrf_k": rrf_k,
         "metadata_filters": metadata_filters,
+        "dense_stats": {},
+        "sparse_stats": {},
+        "fusion_stats": {},
+        "warnings": warnings or [],
     }
 
 
