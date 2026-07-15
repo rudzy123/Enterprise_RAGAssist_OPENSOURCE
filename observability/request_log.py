@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import List, Optional
 
 from observability.traces import build_step_log, log_event
-from retrieval.result_format import format_document_source, make_text_preview
 
 REQUEST_LOGS_DIR = Path(__file__).resolve().parents[1] / "traces" / "requests"
 
 
 def summarize_chunk(chunk: dict) -> dict:
     """Compact chunk summary for logs and trace storage."""
+    from retrieval.result_format import format_document_source, make_text_preview
+
     source_file = chunk.get("source_file", "Unknown")
     section_title = chunk.get("section_title", "Unknown")
     return {

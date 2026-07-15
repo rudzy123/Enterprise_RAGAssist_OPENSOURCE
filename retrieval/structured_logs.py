@@ -9,11 +9,16 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from observability import log_event
 from retrieval.result_format import (
     format_document_source,
     make_text_preview,
 )
+
+
+def _get_log_event():
+    from observability import log_event
+
+    return log_event
 
 
 def chunk_log_entry(chunk: dict, rank: Optional[int] = None) -> dict:
@@ -53,7 +58,7 @@ def log_retrieved_candidates(
     trace_id: Optional[str] = None,
     retrieve_k: Optional[int] = None,
 ) -> None:
-    log_event(
+    _get_log_event()(
         logger,
         "retrieval_candidates",
         trace_id=trace_id,
@@ -80,7 +85,7 @@ def log_similarity_scores(
         entry["passed_threshold"] = chunk.get("chunk_id") in passed_ids
         scored.append(entry)
 
-    log_event(
+    _get_log_event()(
         logger,
         "retrieval_similarity_scores",
         trace_id=trace_id,
@@ -101,7 +106,7 @@ def log_rerank_scores(
     rerank_enabled: bool = True,
     rerank_model: Optional[str] = None,
 ) -> None:
-    log_event(
+    _get_log_event()(
         logger,
         "retrieval_rerank_scores",
         trace_id=trace_id,
@@ -124,7 +129,7 @@ def log_final_selection(
     final_k: Optional[int] = None,
     max_chunks_per_file: Optional[int] = None,
 ) -> None:
-    log_event(
+    _get_log_event()(
         logger,
         "retrieval_final_selection",
         trace_id=trace_id,
@@ -145,7 +150,7 @@ def log_retrieval_results(
     top_k: Optional[int] = None,
 ) -> None:
     """Emit a consolidated structured log of the final retrieval output."""
-    log_event(
+    _get_log_event()(
         logger,
         "retrieval_results",
         trace_id=trace_id,

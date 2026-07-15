@@ -85,7 +85,8 @@ def test_log_retrieval_pipeline_emits_results_event():
     ]
     final = enrich_retrieved_chunks(raw)
 
-    with patch("retrieval.structured_logs.log_event") as mock_log:
+    with patch("retrieval.structured_logs._get_log_event") as mock_get:
+        mock_log = mock_get.return_value
         log_retrieval_pipeline(
             logger,
             "test query",
