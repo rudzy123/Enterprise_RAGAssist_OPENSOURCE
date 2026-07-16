@@ -36,41 +36,54 @@ from config import NOT_FOUND_ANSWER, OPENAI_MODEL
 logger = logging.getLogger("enterprise_rag.generation")
 
 # Mandated response layout for LLM (and structured retrieval-only) answers.
+# Citation validator (answer_has_chunk_citations) requires either:
+#   (a) an exact citation_label like [file.md - Section] somewhere in the answer, OR
+#   (b) "## 3. Source References" / "### Reference " plus the chunk's source_file or
+#       document_source string appearing in the answer.
 SYSTEM_PROMPT = f"""You are an expert enterprise security and compliance consultant.
 Answer ONLY from the retrieved evidence provided by the user. Do not use outside knowledge.
 Never invent controls, policies, or sources.
 
 If the evidence is insufficient to answer, respond with exactly: {NOT_FOUND_ANSWER}
 
-When evidence is sufficient, your entire reply MUST use this exact markdown layout
+CRITICAL — citation validation (answers without this are rejected):
+1. In section "## 1. Response", end at least one bullet or sentence with an exact
+   citation_label copied character-for-character from the evidence block
+   (example shape: [filename.md - Section Title]). Copy the value of citation_label
+   including the square brackets. Do not invent labels. Do not paraphrase filenames.
+2. In section "## 3. Source References", every Reference MUST include:
+   * **Source Document:** <exact source_file value from that evidence block>
+   Paste the source_file string exactly (e.g. nist_800_53_selected_controls.md).
+
+When evidence is sufficient, your entire reply MUST use these three headings exactly
 (no preface, no closing remarks outside these sections):
 
 ---
 ## 1. Response
-[A fluid, conversational, highly professional answer. Use bolding and structured
-bullet points where helpful. Stay grounded in the evidence, but do NOT use robotic
-meta-talk such as "According to Document 1", "The context says", or "Based on the
-retrieved chunks". Write as a consultant speaking to a client.]
+[Fluid, professional consultant answer. Bold key requirements. Use short bullets.
+End key bullets with an exact citation_label from the evidence, e.g.
+- **Physical access authorization** is required for server rooms. [file.md - PE-2]
+Do NOT say "According to Document 1", "The context says", or "Based on the chunks".]
 
 ## 2. Thought Process & Reasoning
-[2–3 sentences explaining how you arrived at the answer: which query keywords matched
-which controls/sections, how overlapping guidance was synthesized across sources, and
-what unrelated noise was filtered out.]
+[2–3 sentences: which query keywords matched which controls/sections, how sources
+were synthesized, and what unrelated noise was filtered out.]
 
 ## 3. Source References
-### Reference A: [Descriptive title of the match]
-* **Source Document:** [Exact source_file / section metadata from the evidence block]
-* **Relevance Score:** [similarity_score from the evidence block as 0.XX]
+### Reference A: [Short descriptive title]
+* **Source Document:** [PASTE exact source_file from Evidence A, e.g. nist_800_53_selected_controls.md]
+* **Relevance Score:** [PASTE similarity_score as 0.XX from that evidence block]
 * **Exact Context Match:**
-> "[Exact relevant snippet from that source — do not invent or heavily paraphrase the proof sentence.]"
+> "[Quote the proof sentence from that evidence text]"
 
-[Add Reference B, C, … for each retrieved evidence block you relied on, in order.]
+### Reference B: ...
+[One Reference per evidence block used, in order A, B, C, …]
 ---
 
 Rules:
-- Use ONLY the retrieved evidence. Copy Source Document names and Relevance Scores from the evidence metadata.
-- Include one Source Reference per evidence block that supports the Response (typically all provided blocks).
-- Do not invent similarity scores or document names.
+- Copy citation_label, source_file, and similarity_score exactly from the evidence metadata.
+- Include Source References for every evidence block you relied on.
+- Do not invent scores, filenames, or control IDs not present in the evidence.
 """
 
 
@@ -171,17 +184,20 @@ def answer_has_structured_layout(answer: str) -> bool:
 
 def build_generation_prompt(query: str, context: str, citation_labels: List[str]) -> str:
     labels_text = "\n".join(f"- {label}" for label in citation_labels)
-    return f"""Retrieved evidence (use metadata for Source References; ground the Response only on text):
+    return f"""Retrieved evidence (copy citation_label / source_file / similarity_score exactly):
 
 {context}
 
-Citation labels (for traceability):
+ALLOWED citation_label values (copy one of these EXACTLY into ## 1. Response, including brackets):
 {labels_text}
 
 User question: {query}
 
-Produce the mandated three-section markdown answer (Response, Thought Process & Reasoning,
-Source References). If evidence is insufficient, respond with exactly: {NOT_FOUND_ANSWER}
+Output format requirements:
+1. Use headings exactly: "## 1. Response", "## 2. Thought Process & Reasoning", "## 3. Source References"
+2. In ## 1. Response, include at least one allowed citation_label verbatim.
+3. In ## 3. Source References, set **Source Document:** to the evidence source_file string.
+4. If evidence is insufficient, respond with exactly: {NOT_FOUND_ANSWER}
 """
 
 
