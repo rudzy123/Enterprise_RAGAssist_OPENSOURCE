@@ -4,7 +4,9 @@ from unittest.mock import MagicMock, patch
 
 from answer_generation.confidence import assess_retrieval_context, is_low_confidence
 from answer_generation.generation import (
+    SYSTEM_PROMPT,
     answer_has_chunk_citations,
+    answer_has_structured_layout,
     build_generation_prompt,
     chunk_citation,
     ensure_cited_answer,
@@ -38,11 +40,15 @@ def test_retrieval_only_answer_includes_citations():
             "section_title": "Intro",
             "text": "Hello world",
             "similarity_score": 0.8,
+            "rank": 1,
         }
     ]
     answer = generate_retrieval_only_answer("q", chunks)
+    assert answer_has_structured_layout(answer)
     assert "[a.md - Intro]" in answer
     assert "Hello world" in answer
+    assert "**Relevance Score:** 0.80" in answer
+    assert "### Reference A:" in answer
 
 
 def test_low_confidence_returns_not_found():
@@ -91,19 +97,46 @@ def test_assess_retrieval_context_no_raw_candidates():
     assert reason == "No documents matched the query"
 
 
-def test_build_generation_prompt_requires_citations():
-    chunks = [{"source_file": "a.md", "section_title": "S", "text": "body"}]
+def test_format_chunks_includes_metadata_and_scores():
+    chunks = [
+        {
+            "source_file": "nist.md",
+            "section_title": "AC-2",
+            "text": "Account management guidance.",
+            "similarity_score": 0.87,
+            "rank": 1,
+            "chunk_id": "c1",
+        }
+    ]
+    context, labels = format_chunks_for_prompt(chunks)
+    assert "similarity_score: 0.87" in context
+    assert "source_file: nist.md" in context
+    assert "rank: 1" in context
+    assert "chunk_id: c1" in context
+    assert "Account management guidance." in context
+    assert labels == ["[nist.md - AC-2]"]
+
+
+def test_build_generation_prompt_requires_structured_layout():
+    chunks = [{"source_file": "a.md", "section_title": "S", "text": "body", "similarity_score": 0.9}]
     context, labels = format_chunks_for_prompt(chunks)
     prompt = build_generation_prompt("What?", context, labels)
     assert "[a.md - S]" in prompt
     assert NOT_FOUND_ANSWER in prompt
-    assert "ONLY" in prompt
-    assert "inline citation" in prompt.lower()
+    assert "Source References" in prompt
+    assert "## 1. Response" in SYSTEM_PROMPT
+    assert "## 2. Thought Process" in SYSTEM_PROMPT
+    assert "## 3. Source References" in SYSTEM_PROMPT
+    assert "Grounding" in SYSTEM_PROMPT or "ONLY from the retrieved" in SYSTEM_PROMPT
 
 
 def test_answer_has_chunk_citations():
     chunks = [{"source_file": "a.md", "section_title": "S", "text": "x"}]
     assert answer_has_chunk_citations("Fact [a.md - S].", chunks)
+    assert answer_has_chunk_citations(
+        "## 3. Source References\n### Reference A\n* **Source Document:** a.md - S",
+        chunks,
+    )
     assert not answer_has_chunk_citations("Fact without cite.", chunks)
 
 
@@ -117,6 +150,7 @@ def test_ensure_cited_answer_falls_back_to_snippets():
         }
     ]
     answer = ensure_cited_answer("Uncited answer.", chunks)
+    assert answer_has_structured_layout(answer)
     assert "[a.md - S]" in answer
     assert "Important text" in answer
 
@@ -310,6 +344,7 @@ def test_strong_context_returns_cited_answer():
         use_llm=False,
     )
     assert answer != NOT_FOUND_ANSWER
+    assert answer_has_structured_layout(answer)
     assert "[a.md - Intro]" in answer
     assert confidence > 0.3
     assert obs["generation_mode"] == "retrieval_only"

@@ -1,5 +1,5 @@
 """
-Answer generation with mandatory chunk citations and low-confidence abstention.
+Answer generation with structured, grounded, audit-ready responses.
 
 All answers are grounded exclusively in retrieved chunks. Weak retrieval context
 returns a configured not-found response with a retrieval-quality confidence score.
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import string
 from typing import List, Optional, Tuple
 
 import ollama
@@ -34,6 +35,44 @@ from config import NOT_FOUND_ANSWER, OPENAI_MODEL
 
 logger = logging.getLogger("enterprise_rag.generation")
 
+# Mandated response layout for LLM (and structured retrieval-only) answers.
+SYSTEM_PROMPT = f"""You are an expert enterprise security and compliance consultant.
+Answer ONLY from the retrieved evidence provided by the user. Do not use outside knowledge.
+Never invent controls, policies, or sources.
+
+If the evidence is insufficient to answer, respond with exactly: {NOT_FOUND_ANSWER}
+
+When evidence is sufficient, your entire reply MUST use this exact markdown layout
+(no preface, no closing remarks outside these sections):
+
+---
+## 1. Response
+[A fluid, conversational, highly professional answer. Use bolding and structured
+bullet points where helpful. Stay grounded in the evidence, but do NOT use robotic
+meta-talk such as "According to Document 1", "The context says", or "Based on the
+retrieved chunks". Write as a consultant speaking to a client.]
+
+## 2. Thought Process & Reasoning
+[2–3 sentences explaining how you arrived at the answer: which query keywords matched
+which controls/sections, how overlapping guidance was synthesized across sources, and
+what unrelated noise was filtered out.]
+
+## 3. Source References
+### Reference A: [Descriptive title of the match]
+* **Source Document:** [Exact source_file / section metadata from the evidence block]
+* **Relevance Score:** [similarity_score from the evidence block as 0.XX]
+* **Exact Context Match:**
+> "[Exact relevant snippet from that source — do not invent or heavily paraphrase the proof sentence.]"
+
+[Add Reference B, C, … for each retrieved evidence block you relied on, in order.]
+---
+
+Rules:
+- Use ONLY the retrieved evidence. Copy Source Document names and Relevance Scores from the evidence metadata.
+- Include one Source Reference per evidence block that supports the Response (typically all provided blocks).
+- Do not invent similarity scores or document names.
+"""
+
 
 def chunk_citation(chunk: dict) -> str:
     """Canonical inline citation label for a retrieved chunk."""
@@ -43,78 +82,166 @@ def chunk_citation(chunk: dict) -> str:
     return f"[{source}]"
 
 
+def _format_relevance_score(chunk: dict) -> str:
+    """Format similarity (or rerank) score as 0.XX for Source References."""
+    score = chunk.get("similarity_score")
+    if score is None and chunk.get("rerank_score") is not None:
+        score = chunk["rerank_score"]
+    try:
+        return f"{float(score):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _source_document_label(chunk: dict) -> str:
+    """Human-readable source label including optional chunk sequence."""
+    base = chunk.get("document_source") or (
+        f"{chunk.get('source_file', 'unknown')} - {chunk.get('section_title', 'section')}"
+    )
+    rank = chunk.get("rank")
+    chunk_id = chunk.get("chunk_id")
+    parts = [base]
+    if rank is not None:
+        parts.append(f"rank {rank}")
+    if chunk_id:
+        parts.append(f"id {chunk_id}")
+    if len(parts) == 1:
+        return base
+    return f"{base} ({', '.join(parts[1:])})"
+
+
+def _reference_letter(index: int) -> str:
+    """0 → A, 1 → B, …"""
+    if 0 <= index < 26:
+        return string.ascii_uppercase[index]
+    return str(index + 1)
+
+
 def format_chunks_for_prompt(chunks: List[dict]) -> Tuple[str, List[str]]:
-    """Build labeled context block and list of citation labels."""
+    """
+    Build evidence block with text + metadata for the LLM prompt.
+
+    Each chunk includes source file, section, rank, similarity score, and raw text
+    so the model can populate the Source References section accurately.
+    """
     parts = []
     labels = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         label = chunk_citation(chunk)
         labels.append(label)
-        parts.append(f"{label}\n{chunk['text'].strip()}")
+        letter = _reference_letter(i)
+        score = _format_relevance_score(chunk)
+        source_doc = _source_document_label(chunk)
+        text = (chunk.get("text") or "").strip()
+        parts.append(
+            f"### Evidence {letter}\n"
+            f"- citation_label: {label}\n"
+            f"- source_document: {source_doc}\n"
+            f"- source_file: {chunk.get('source_file', '')}\n"
+            f"- section_title: {chunk.get('section_title', '')}\n"
+            f"- rank: {chunk.get('rank', i + 1)}\n"
+            f"- similarity_score: {score}\n"
+            f"- chunk_id: {chunk.get('chunk_id', '')}\n"
+            f"- text:\n{text}"
+        )
     return "\n\n".join(parts), labels
 
 
 def answer_has_chunk_citations(answer: str, chunks: List[dict]) -> bool:
-    """True if the answer cites at least one retrieved chunk label."""
+    """True if the answer cites retrieved sources (inline labels or Source References)."""
     if not chunks:
         return True
-    return any(chunk_citation(chunk) in answer for chunk in chunks)
+    if any(chunk_citation(chunk) in answer for chunk in chunks):
+        return True
+    # Structured layout: Source Document lines must mention retrieved sources
+    if "## 3. Source References" in answer or "### Reference " in answer:
+        return any(
+            (chunk.get("source_file") or "") in answer
+            or (chunk.get("document_source") or "") in answer
+            for chunk in chunks
+        )
+    return False
+
+
+def answer_has_structured_layout(answer: str) -> bool:
+    """True if the answer includes the mandated three-section headings."""
+    required = ("## 1. Response", "## 2. Thought Process", "## 3. Source References")
+    return all(section in answer for section in required)
 
 
 def build_generation_prompt(query: str, context: str, citation_labels: List[str]) -> str:
     labels_text = "\n".join(f"- {label}" for label in citation_labels)
-    return f"""You are a careful assistant that answers questions using ONLY the retrieved chunks below.
+    return f"""Retrieved evidence (use metadata for Source References; ground the Response only on text):
 
-Retrieved chunks (citation labels must be copied exactly):
 {context}
 
-Allowed citation labels:
+Citation labels (for traceability):
 {labels_text}
 
-Question: {query}
+User question: {query}
 
-Rules:
-- Use ONLY information from the retrieved chunks above. Do not use outside knowledge.
-- Every sentence in your answer MUST include at least one inline citation using an allowed label.
-- Do not invent sources or cite labels that are not listed above.
-- If the chunks do not contain enough information to answer, respond with exactly: {NOT_FOUND_ANSWER}
-
-Answer:"""
+Produce the mandated three-section markdown answer (Response, Thought Process & Reasoning,
+Source References). If evidence is insufficient, respond with exactly: {NOT_FOUND_ANSWER}
+"""
 
 
 def _chat_messages(query: str, chunks: List[dict]) -> Tuple[list, dict]:
     """Build chat messages and observability prompt payload for an LLM call."""
     context, citation_labels = format_chunks_for_prompt(chunks)
     prompt = build_generation_prompt(query, context, citation_labels)
-    system_message = (
-        "You answer only from provided retrieved chunks. "
-        "Do not use any outside knowledge. "
-        "Every sentence must include an inline citation. "
-        f"If unsure, respond with exactly: {NOT_FOUND_ANSWER}"
-    )
     messages = [
-        {"role": "system", "content": system_message},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
     return messages, {"messages": messages}
 
 
 def generate_retrieval_only_answer(question: str, chunks: List[dict]) -> str:
-    """Return cited snippets from retrieved chunks (no LLM)."""
+    """
+    Structured fallback when no LLM is used: same three-section layout,
+    with Response built from cited snippets.
+    """
     if not chunks:
         return NOT_FOUND_ANSWER
 
-    lines = []
+    response_lines = []
     for chunk in chunks:
         cite = chunk_citation(chunk)
         snippet = chunk["text"].strip().replace("\n", " ")
-        lines.append(f"{cite} {snippet}")
+        response_lines.append(f"- {cite} {snippet}")
 
-    return "\n".join(lines)
+    sources = []
+    for i, chunk in enumerate(chunks):
+        letter = _reference_letter(i)
+        title = chunk.get("section_title") or chunk.get("source_file") or "Retrieved passage"
+        sources.append(
+            f"### Reference {letter}: {title}\n"
+            f"* **Source Document:** {_source_document_label(chunk)}\n"
+            f"* **Relevance Score:** {_format_relevance_score(chunk)}\n"
+            f"* **Exact Context Match:**\n"
+            f"> \"{chunk['text'].strip()}\""
+        )
+
+    thought = (
+        "Retrieved passages were ranked by semantic similarity to the query; "
+        "the Response lists the highest-scoring grounded snippets. "
+        "No generative model was used (retrieval-only mode)."
+    )
+
+    return (
+        "---\n"
+        "## 1. Response\n"
+        + "\n".join(response_lines)
+        + "\n\n## 2. Thought Process & Reasoning\n"
+        + thought
+        + "\n\n## 3. Source References\n"
+        + "\n\n".join(sources)
+        + "\n---"
+    )
 
 
 def ensure_cited_answer(answer: str, chunks: List[dict]) -> str:
-    """Ensure the answer includes chunk citations or fall back to cited snippets."""
+    """Ensure the answer is grounded; fall back to structured retrieval-only if not."""
     if answer.strip().lower() == NOT_FOUND_ANSWER.lower():
         return NOT_FOUND_ANSWER
     if answer_has_chunk_citations(answer, chunks):
@@ -138,10 +265,13 @@ def _finalize_llm_answer(
         }
 
     final_answer = ensure_cited_answer(raw_response, chunks)
+    # If the model omitted the mandated layout but was still grounded, keep content;
+    # structured layout is preferred when the model followed instructions.
     return final_answer, total_tokens, {
         "llm_prompt": llm_prompt,
         "model_response": raw_response,
         "generation_mode": generation_mode,
+        "structured_layout": answer_has_structured_layout(final_answer),
     }
 
 
@@ -151,6 +281,7 @@ def _retrieval_only_result(query: str, chunks: List[dict]) -> Tuple[str, Optiona
         "llm_prompt": None,
         "model_response": answer,
         "generation_mode": "retrieval_only",
+        "structured_layout": answer_has_structured_layout(answer),
     }
 
 
@@ -161,7 +292,7 @@ def generate_with_openai(
     api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[int], dict]:
     """
-    Generate an answer with mandatory citations from retrieved chunks only.
+    Generate a structured, grounded answer from retrieved chunks only.
 
     Returns:
         (answer_text, total_tokens, observability)
@@ -177,7 +308,7 @@ def generate_with_openai(
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
-        max_tokens=500,
+        max_tokens=1200,
         temperature=0.0,
     )
 
@@ -203,7 +334,7 @@ def generate_with_ollama(
     host: Optional[str] = None,
 ) -> Tuple[str, Optional[int], dict]:
     """
-    Generate an answer via ``ollama.chat()`` (default model: llama3.2).
+    Generate a structured answer via ``ollama.chat()`` (default model: llama3.2).
 
     If Ollama is not running / unreachable, logs a warning and returns retrieval-only.
 
@@ -222,13 +353,12 @@ def generate_with_ollama(
     }
 
     try:
-        # ollama.chat() API; Client(host=...) respects OLLAMA_HOST
         response = ollama.Client(host=ollama_host).chat(
             model=ollama_model,
             messages=messages,
             options={
                 "temperature": OLLAMA_TEMPERATURE,
-                "num_predict": 500,
+                "num_predict": 1200,
             },
         )
     except Exception as exc:
@@ -326,7 +456,6 @@ def generate_answer_from_chunks(
             model=OLLAMA_MODEL or "llama3.2",
             host=OLLAMA_HOST,
         )
-        # Graceful fallback when Ollama is not running
         if llm_obs.get("generation_mode") == "retrieval_only":
             observability["llm_provider"] = "retrieval_only"
         observability.update(llm_obs)
