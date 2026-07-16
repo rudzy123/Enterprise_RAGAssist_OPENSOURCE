@@ -1,11 +1,9 @@
 """
 Answer generation with citations from retrieved chunks.
 
-Uses OpenAI API to generate answers based only on retrieved context,
+Uses Ollama, OpenAI, or retrieval-only snippets based on LLM_PROVIDER,
 with mandatory inline citations and low-confidence abstention.
 """
-
-import os
 
 from answer_generation.generation import generate_answer_from_chunks
 from config import NOT_FOUND_ANSWER
@@ -40,7 +38,7 @@ def generate_answer_with_citations(query: str):
     answer, confidence, confidence_reason, _, _ = generate_answer_from_chunks(
         query,
         chunks,
-        use_llm=bool(os.getenv("OPENAI_API_KEY")),
+        use_llm=True,
     )
 
     print(f"✓ Confidence: {confidence:.2f} ({confidence_reason})")

@@ -8,7 +8,6 @@ saves timestamped JSON results, and prints summary metrics.
 
 import argparse
 import json
-import os
 import sys
 import time
 from datetime import datetime
@@ -324,7 +323,7 @@ def main():
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="Use retrieval-only answer generation (no OpenAI)",
+        help="Use retrieval-only answer generation (no LLM)",
     )
     parser.add_argument(
         "--final-k-values",
@@ -354,9 +353,14 @@ def main():
     print(f"Loaded {len(questions)} questions from {args.jsonl_path}")
 
     rerank_enabled = not args.no_rerank
-    use_llm = not args.no_llm and bool(os.getenv("OPENAI_API_KEY"))
-    if not args.no_llm and not use_llm:
-        print("No OPENAI_API_KEY set — using retrieval-only answer generation.")
+    from config import resolve_llm_provider
+
+    use_llm = not args.no_llm
+    if args.no_llm:
+        print("(--no-llm) Using retrieval-only answer generation.")
+    else:
+        provider = resolve_llm_provider(use_llm=True)
+        print(f"LLM provider: {provider}")
 
     from config import FINAL_K, HYBRID_SEARCH, MIN_CHUNK_SIMILARITY
 

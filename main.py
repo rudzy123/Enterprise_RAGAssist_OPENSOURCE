@@ -24,13 +24,19 @@ from core.config import (
     DEBUG_MODE,
     FINAL_K,
     HYBRID_SEARCH,
+    LLM_PROVIDER,
     MAX_FINAL_K,
     MAX_QUESTION_LENGTH,
     MIN_CHUNK_SIMILARITY,
     MIN_SIMILARITY_THRESHOLD,
     NOT_FOUND_ANSWER,
+    OLLAMA_HOST,
+    OLLAMA_MODEL,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
     RATE_LIMIT,
     RETRIEVE_K,
+    resolve_llm_provider,
 )
 from core.embeddings import get_embedding_model
 from core.vector_store import collection_count
@@ -66,6 +72,29 @@ async def lifespan(app: FastAPI):
         app.state.logger.info(
             json.dumps({"event": "startup", "message": "API key authentication enabled."})
         )
+
+    resolved = resolve_llm_provider()
+    mode_label = {
+        "ollama": f"ollama / {OLLAMA_MODEL or 'llama3.2'} ({OLLAMA_HOST})",
+        "openai": f"openai / {OPENAI_MODEL}",
+        "retrieval_only": "retrieval_only",
+    }.get(resolved, resolved)
+    startup_msg = f"Active LLM provider: {mode_label}"
+    app.state.logger.info(
+        json.dumps(
+            {
+                "event": "startup",
+                "message": startup_msg,
+                "llm_provider": LLM_PROVIDER or None,
+                "resolved_provider": resolved,
+                "ollama_host": OLLAMA_HOST,
+                "ollama_model": OLLAMA_MODEL,
+                "openai_configured": bool(OPENAI_API_KEY),
+                "openai_model": OPENAI_MODEL,
+            }
+        )
+    )
+    print(f"[startup] {startup_msg}", flush=True)
 
     # Warm embedding model so /ready reflects true startup cost.
     try:
@@ -147,6 +176,16 @@ class Answer(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class StatusResponse(BaseModel):
+    status: str
+    llm_provider: Optional[str] = None
+    resolved_provider: str
+    ollama_host: str
+    ollama_model: str
+    openai_configured: bool
+    openai_model: str
 
 
 class ReadyResponse(BaseModel):
@@ -253,6 +292,20 @@ def save_trace(trace: dict):
 def health():
     """Liveness probe: process is running (always HTTP 200)."""
     return HealthResponse(status="ok")
+
+
+@app.get("/status", response_model=StatusResponse)
+def status():
+    """Lightweight config status, including active LLM provider selection."""
+    return StatusResponse(
+        status="ok",
+        llm_provider=LLM_PROVIDER or None,
+        resolved_provider=resolve_llm_provider(),
+        ollama_host=OLLAMA_HOST,
+        ollama_model=OLLAMA_MODEL,
+        openai_configured=bool(OPENAI_API_KEY),
+        openai_model=OPENAI_MODEL,
+    )
 
 
 @app.get("/ready", response_model=ReadyResponse)
@@ -445,7 +498,7 @@ def ask(
             generate_answer_from_chunks(
                 question.question,
                 filtered_chunks,
-                use_llm=bool(os.getenv("OPENAI_API_KEY")),
+                use_llm=True,
                 raw_candidate_count=len(raw_candidates),
             )
         )

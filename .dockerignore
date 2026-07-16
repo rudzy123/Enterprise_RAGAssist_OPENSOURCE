@@ -17,16 +17,21 @@ traces/
 logs/
 *.sqlite
 
+# Large raw PDFs are not required for curated ingest
+data/raw_docs/
+
 # Git
 .git/
 .gitignore
 
-# Docs / dev
+# Docs / dev — keep README and the curated corpus for Docker ingest
 *.md
 !README.md
+!data/docs/curated/*.md
 tests/
 evals/results*.json
 evals/sweep_results*.json
 
 # Cursor / local
 .cursor/
+ollama/

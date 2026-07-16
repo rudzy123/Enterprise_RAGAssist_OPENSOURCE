@@ -8,6 +8,7 @@ from answer_generation.generation import (
     ensure_cited_answer,
     generate_answer_from_chunks,
     generate_retrieval_only_answer,
+    generate_with_ollama,
     generate_with_openai,
 )
 from config import NOT_FOUND_ANSWER
@@ -20,6 +21,7 @@ __all__ = [
     "ensure_cited_answer",
     "generate_answer_from_chunks",
     "generate_retrieval_only_answer",
+    "generate_with_ollama",
     "generate_with_openai",
     "is_low_confidence",
 ]

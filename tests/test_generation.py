@@ -11,6 +11,7 @@ from answer_generation.generation import (
     format_chunks_for_prompt,
     generate_answer_from_chunks,
     generate_retrieval_only_answer,
+    generate_with_ollama,
     generate_with_openai,
 )
 from config import MIN_SIMILARITY_THRESHOLD, NOT_FOUND_ANSWER
@@ -139,6 +140,159 @@ def test_generate_with_openai_fallback_when_no_citations():
 
     assert "[a.md - S]" in answer
     assert "Important text" in answer
+
+
+def test_generate_with_ollama_uses_local_endpoint():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "S",
+            "text": "Important text",
+            "similarity_score": 0.9,
+        }
+    ]
+    mock_response = MagicMock()
+    mock_response.message = MagicMock(content="Important text [a.md - S].")
+    mock_response.prompt_eval_count = 10
+    mock_response.eval_count = 5
+
+    with patch("answer_generation.generation.ollama.Client") as mock_client_cls:
+        mock_client_cls.return_value.chat.return_value = mock_response
+        answer, tokens, obs = generate_with_ollama(
+            "q",
+            chunks,
+            model="llama3.2",
+            host="http://localhost:11434",
+        )
+
+    mock_client_cls.assert_called_once_with(host="http://localhost:11434")
+    assert mock_client_cls.return_value.chat.call_args.kwargs["options"]["temperature"] == 0.0
+    assert "[a.md - S]" in answer
+    assert tokens == 15
+    assert obs["llm_prompt"]["provider"] == "ollama"
+    assert obs["llm_prompt"]["temperature"] == 0.0
+    assert obs["generation_mode"] == "llm"
+
+
+def test_generate_with_ollama_falls_back_when_unavailable():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "S",
+            "text": "Important text",
+            "similarity_score": 0.9,
+        }
+    ]
+    with patch("answer_generation.generation.ollama.Client") as mock_client_cls:
+        mock_client_cls.return_value.chat.side_effect = ConnectionError("refused")
+        answer, tokens, obs = generate_with_ollama("q", chunks, model="llama3.2")
+
+    assert tokens is None
+    assert obs["generation_mode"] == "retrieval_only"
+    assert "[a.md - S]" in answer
+    assert "Important text" in answer
+    assert "ollama_error" in obs
+
+
+def test_generate_answer_routes_to_ollama_when_provider_ollama():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "Intro",
+            "text": "Incident response starts with detection.",
+            "similarity_score": 0.85,
+        }
+    ]
+    with (
+        patch("answer_generation.generation.LLM_PROVIDER", "ollama"),
+        patch(
+            "answer_generation.generation.generate_with_ollama",
+            return_value=(
+                "Incident response starts with detection. [a.md - Intro]",
+                None,
+                {
+                    "llm_prompt": {"provider": "ollama"},
+                    "model_response": "ok",
+                    "generation_mode": "llm",
+                },
+            ),
+        ) as mock_ollama,
+    ):
+        answer, _, _, _, obs = generate_answer_from_chunks("q", chunks, use_llm=True)
+
+    mock_ollama.assert_called_once()
+    assert obs["llm_provider"] == "ollama"
+    assert "[a.md - Intro]" in answer
+
+
+def test_generate_answer_falls_back_to_retrieval_when_ollama_unavailable():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "Intro",
+            "text": "Incident response starts with detection.",
+            "similarity_score": 0.85,
+        }
+    ]
+    with (
+        patch("answer_generation.generation.LLM_PROVIDER", "ollama"),
+        patch(
+            "answer_generation.generation.generate_with_ollama",
+            return_value=(
+                "[a.md - Intro] Incident response starts with detection.",
+                None,
+                {
+                    "llm_prompt": {"provider": "ollama"},
+                    "model_response": "fallback",
+                    "generation_mode": "retrieval_only",
+                    "ollama_error": "refused",
+                },
+            ),
+        ),
+        patch(
+            "answer_generation.generation.generate_with_openai",
+        ) as mock_openai,
+    ):
+        answer, _, _, tokens, obs = generate_answer_from_chunks("q", chunks, use_llm=True)
+
+    mock_openai.assert_not_called()
+    assert tokens is None
+    assert obs["llm_provider"] == "retrieval_only"
+    assert obs["generation_mode"] == "retrieval_only"
+    assert "[a.md - Intro]" in answer
+
+
+def test_generate_answer_uses_openai_when_key_and_not_ollama():
+    chunks = [
+        {
+            "source_file": "a.md",
+            "section_title": "Intro",
+            "text": "Incident response starts with detection.",
+            "similarity_score": 0.85,
+        }
+    ]
+    with (
+        patch("answer_generation.generation.LLM_PROVIDER", ""),
+        patch("answer_generation.generation.OPENAI_API_KEY", "sk-test"),
+        patch(
+            "answer_generation.generation.generate_with_openai",
+            return_value=(
+                "Incident response starts with detection. [a.md - Intro]",
+                12,
+                {
+                    "llm_prompt": {"provider": "openai"},
+                    "model_response": "ok",
+                    "generation_mode": "llm",
+                },
+            ),
+        ) as mock_openai,
+    ):
+        answer, _, _, tokens, obs = generate_answer_from_chunks("q", chunks, use_llm=True)
+
+    mock_openai.assert_called_once()
+    assert tokens == 12
+    assert obs["llm_provider"] == "openai"
+    assert "[a.md - Intro]" in answer
 
 
 def test_strong_context_returns_cited_answer():

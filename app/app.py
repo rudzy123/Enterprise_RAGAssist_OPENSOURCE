@@ -11,12 +11,15 @@ Minimal Streamlit UI for Enterprise RAG Assistant.
 Calls the FastAPI backend for consistent tracing, auth, and rate limiting.
 """
 
-import os
-
 import httpx
 import streamlit as st
 
-from core.config import API_KEY, API_URL, NOT_FOUND_ANSWER
+from core.config import (
+    API_KEY,
+    API_URL,
+    NOT_FOUND_ANSWER,
+    resolve_llm_provider,
+)
 
 
 def _api_headers() -> dict:
@@ -39,6 +42,41 @@ def ask_api(question: str, final_k: int = 3) -> dict:
     return response.json()
 
 
+def fetch_llm_status() -> dict:
+    """Read LLM provider status from the API (/status). Falls back to local resolve."""
+    try:
+        response = httpx.get(f"{API_URL}/status", headers=_api_headers(), timeout=5.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return {
+            "resolved_provider": resolve_llm_provider(),
+            "llm_provider": None,
+            "ollama_model": None,
+            "openai_configured": False,
+            "source": "local_fallback",
+        }
+
+
+def format_powered_by_label(status: dict) -> str:
+    """Human-readable active generation mode for the UI."""
+    provider = status.get("resolved_provider") or resolve_llm_provider()
+    if provider == "ollama":
+        model = (status.get("ollama_model") or "llama3.2").strip()
+        if model.lower().startswith("llama"):
+            # llama3.2 → Llama 3.2
+            display = f"Llama {model[5:]}"
+        else:
+            display = model
+        return f"🦙 Powered by {display}"
+    if provider == "openai":
+        model = (status.get("openai_model") or "OpenAI").strip()
+        if model.lower().startswith("gpt"):
+            return f"☁️ Powered by {model}"
+        return "☁️ Powered by OpenAI"
+    return "📄 Retrieval-only Mode"
+
+
 def main():
     st.set_page_config(
         page_title="Enterprise RAG Assistant",
@@ -46,6 +84,12 @@ def main():
         layout="wide",
     )
 
+    status = fetch_llm_status()
+    powered_by = format_powered_by_label(status)
+    provider = status.get("resolved_provider") or resolve_llm_provider()
+
+    # Current mode banner at the top
+    st.markdown(f"### {powered_by}")
     st.title("🤖 Enterprise RAG Assistant")
     st.markdown(
         "Ask questions about enterprise security policies and incident response procedures."
@@ -59,15 +103,14 @@ def main():
         else:
             st.warning("⚠️ API_KEY not set. Backend must allow unauthenticated access.")
 
-        st.header("🔑 OpenAI")
-        st.caption(
-            "OpenAI generation is configured on the API server via OPENAI_API_KEY. "
-            "Set it in the server environment for LLM answers."
-        )
-        if os.getenv("OPENAI_API_KEY"):
-            st.success("✅ OPENAI_API_KEY detected in this environment.")
-        else:
-            st.info("ℹ️ No OPENAI_API_KEY here. Server may still use retrieval-only mode.")
+        st.header("🧠 LLM provider")
+        st.caption("Shown from the API /status endpoint.")
+        st.markdown(f"**Mode:** {powered_by}")
+        if status.get("llm_provider"):
+            st.caption(f"LLM_PROVIDER={status['llm_provider']}")
+        st.caption(f"Resolved: `{provider}`")
+        if status.get("source") == "local_fallback":
+            st.warning("Could not reach API /status; showing local fallback.")
 
     st.header("❓ Ask a Question")
     question = st.text_input(
@@ -123,6 +166,7 @@ def main():
                         )
 
                 st.header("🤖 Generated Answer")
+                st.caption(powered_by)
                 if answer == NOT_FOUND_ANSWER:
                     st.warning(f"{NOT_FOUND_ANSWER} (confidence: {confidence:.2f})")
                 else:
@@ -147,7 +191,7 @@ def main():
                 st.error(f"An error occurred: {exc}")
 
     st.markdown("---")
-    st.markdown("*Built with Streamlit, FastAPI, ChromaDB, and OpenAI*")
+    st.markdown(f"*Built with Streamlit, FastAPI, ChromaDB — {powered_by}*")
 
 
 if __name__ == "__main__":

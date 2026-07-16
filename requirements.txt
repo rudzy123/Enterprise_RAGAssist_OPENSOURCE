@@ -8,6 +8,7 @@ python-dotenv==1.2.2
 chromadb==0.5.23
 sentence-transformers==3.4.1
 openai==1.109.1
+ollama>=0.4.0
 streamlit==1.59.2
 slowapi==0.1.10
 httpx==0.27.2

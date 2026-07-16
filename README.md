@@ -56,7 +56,7 @@ This project addresses those gaps with a pipeline that **retrieves evidence firs
 │            ▼                                                                 │
 │   ┌──────────────────┐                                                       │
 │   │ answer generation│────► confidence gate (weak context → "Not found")    │
-│   │                  │────► LLM (OpenAI) OR retrieval-only cited snippets    │
+│   │                  │────► LLM (Ollama/OpenAI) OR retrieval-only snippets   │
 │   │                  │────► mandatory [file.md - Section] citations          │
 │   └────────┬─────────┘                                                       │
 │            ▼                                                                 │
@@ -75,7 +75,7 @@ This project addresses those gaps with a pipeline that **retrieves evidence firs
 | Vectors | ChromaDB (persistent, cosine HNSW) |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` |
 | Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| Generation | OpenAI API (`gpt-3.5-turbo`, optional) |
+| Generation | Ollama / OpenAI / retrieval-only (see `LLM_PROVIDER`) |
 | Observability | JSON logs, SQLite traces, per-request JSON files |
 
 ---
@@ -87,7 +87,7 @@ This project addresses those gaps with a pipeline that **retrieves evidence firs
 | **API key auth** | `API_KEY` env var; send via `X-API-Key` or `Authorization: Bearer` header |
 | **Rate limiting** | slowapi — default `30/minute` per API key (or IP if no key) |
 | **Input validation** | Question max length (`MAX_QUESTION_LENGTH=2000`); `final_k` capped at `MAX_FINAL_K` |
-| **Health probes** | `GET /health` (liveness), `GET /ready` (corpus indexed) — no auth required |
+| **Health probes** | `GET /health` (liveness), `GET /ready` (corpus indexed), `GET /status` (LLM mode) — no auth required |
 | **Dev mode** | If `API_KEY` is unset, endpoints are unauthenticated (warning logged at startup) |
 
 > **Production:** Always set `API_KEY`, disable `DEBUG_MODE`, and run without `--reload`.
@@ -251,6 +251,7 @@ PYTHONPATH=. python evals/run_evals.py --hybrid --doc-type policy -v
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/ready
+curl http://localhost:8000/status   # LLM provider + resolved mode
 ```
 
 ---
@@ -282,12 +283,12 @@ curl -fsS http://localhost:8000/ready | python3 -m json.tool
 **Optional Redis cache** (speeds up repeated query embeddings):
 
 ```bash
-# Start API + Redis
-docker compose --profile cache up -d
-
 # In .env:
 #   REDIS_URL=redis://redis:6379/0
 #   CACHE_ENABLED=true
+
+# Start API + Redis
+docker compose --profile cache up -d
 ```
 
 ### Security checklist
@@ -305,6 +306,7 @@ docker compose --profile cache up -d
 
 - **Liveness:** `GET /health` → always `200` when process is up
 - **Readiness:** `GET /ready` → `200` when Chroma is populated (+ BM25 if `HYBRID_SEARCH=true`); `503` otherwise
+- **LLM status:** `GET /status` → configured / resolved provider (`ollama` | `openai` | `retrieval_only`)
 - **Logs:** structured JSON to console and rotating file (`LOG_DIR`, `LOG_MAX_BYTES`)
 - **Global errors:** sanitized `500` responses (details only when `DEBUG_MODE=true`)
 
@@ -338,6 +340,103 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 
 ---
 
+## LLM Configuration
+
+Answer generation supports three modes. Selection follows this **priority**:
+
+1. **Ollama** (llama3.2) — preferred local LLM (`LLM_PROVIDER=ollama`, default)
+2. **Retrieval-only** — cited snippets when Ollama is unavailable / `LLM_PROVIDER=retrieval_only`
+3. **OpenAI** — opt-in last (`LLM_PROVIDER=openai` + `OPENAI_API_KEY`)
+
+Check the active mode at runtime:
+
+```bash
+curl http://localhost:8000/status
+# → {"resolved_provider": "ollama"|"openai"|"retrieval_only", ...}
+```
+
+Startup logs also emit `llm_provider` / `resolved_provider`.
+
+### Use Llama 3.2 locally (Ollama)
+
+1. Install [Ollama](https://ollama.com) for your OS.
+2. Pull the model:
+
+```bash
+ollama pull llama3.2
+```
+
+3. Confirm the server is up (`ollama serve` if it is not already running), then set in `.env`:
+
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2
+```
+
+4. Restart the API. `/status` should report `resolved_provider: "ollama"`.
+
+If Ollama is unreachable or the model is missing, generation falls back to **retrieval-only** (not OpenAI) and logs a warning.
+
+### Force OpenAI or retrieval-only
+
+| Goal | `.env` settings |
+|------|-----------------|
+| **Ollama (Llama 3.2)** | `LLM_PROVIDER=ollama`, `OLLAMA_MODEL=llama3.2` (default) |
+| **Force retrieval-only** | `LLM_PROVIDER=retrieval_only` |
+| **Force OpenAI** | `LLM_PROVIDER=openai` **and** set `OPENAI_API_KEY` |
+
+```bash
+# OpenAI (opt-in; not used just because a key is present)
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-3.5-turbo
+
+# Retrieval-only (cited snippets, no generative model)
+LLM_PROVIDER=retrieval_only
+```
+
+Eval runs can also skip LLMs with `python evals/run_evals.py --no-llm`.
+
+### Docker tips (Ollama alongside the app)
+
+The API image stays lightweight and **does not bundle Ollama**. Run Ollama on the host or as an optional Compose service.
+
+**Host Ollama (simplest):**
+
+```bash
+# On the host
+ollama pull llama3.2
+
+# In .env for the API container
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://host.docker.internal:11434
+OLLAMA_MODEL=llama3.2
+
+docker compose up -d api
+```
+
+`docker-compose.yml` maps `host.docker.internal` so the container can reach Ollama on the Docker host.
+
+**Optional Compose Ollama** (profile `ollama`, off by default):
+
+```bash
+docker compose --profile ollama up -d
+docker compose exec ollama ollama pull llama3.2
+```
+
+Point the API at the service (in `.env`):
+
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://ollama:11434
+OLLAMA_MODEL=llama3.2
+```
+
+Then restart the API (`docker compose up -d api`) so it picks up `OLLAMA_HOST`.
+
+---
+
 ## Configuration (environment)
 
 Loaded from `.env` via `core/config.py` (`python-dotenv`).
@@ -360,7 +459,12 @@ Loaded from `.env` via `core/config.py` (`python-dotenv`).
 | `BM25_RETRIEVE_K` | `15` | BM25 candidate count |
 | `RRF_K` | `60` | RRF rank smoothing constant |
 | `BM25_MIN_SCORE` | `0.30` | Normalized BM25 threshold in hybrid mode |
-| `OPENAI_MODEL` | `gpt-3.5-turbo` | Generation model |
+| `LLM_PROVIDER` | `ollama` | `ollama` (1st) \| `retrieval_only` (2nd) \| `openai` (3rd, opt-in) |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL (`OLLAMA_BASE_URL` accepted as alias) |
+| `OLLAMA_MODEL` | `llama3.2` | Local model name when using Ollama |
+| `OLLAMA_TEMPERATURE` | `0.0` | Ollama sampling temperature (0 for grounded answers) |
+| `OPENAI_API_KEY` | *(empty)* | Required only when `LLM_PROVIDER=openai` |
+| `OPENAI_MODEL` | `gpt-3.5-turbo` | OpenAI generation model |
 | `NOT_FOUND_ANSWER` | `Not found` | Abstention text |
 | `DEBUG_MODE` | `false` | FastAPI debug mode |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
@@ -377,9 +481,9 @@ Loaded from `.env` via `core/config.py` (`python-dotenv`).
 
 ```
 Enterprise_Rag_Assistant/
-├── main.py                     # FastAPI: /ask, /health, /ready, /traces
-├── Dockerfile                  # Production container image
-├── docker-compose.yml          # API + optional Redis + ingest job
+├── main.py                     # FastAPI: /ask, /health, /ready, /status, /traces
+├── Dockerfile                  # Production container image (Ollama not bundled)
+├── docker-compose.yml          # API + optional Redis / Ollama / ingest job
 ├── scripts/
 │   ├── docker-entrypoint.sh    # Container startup
 │   └── check_eval_gate.py      # CI quality gate checker

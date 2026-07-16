@@ -60,11 +60,60 @@ CHROMA_DB_PATH = BASE_DIR / os.getenv("CHROMA_DB_PATH", "chroma_db")
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "enterprise_docs")
 COLLECTION_NAME = CHROMA_COLLECTION_NAME
 
-# Generation
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+# Generation / LLM providers
+# Priority in answer generation:
+#   1. LLM_PROVIDER=ollama → ollama.chat() with llama3.2
+#   2. Else if OPENAI_API_KEY exists → OpenAI
+#   3. Else → retrieval-only
+# If Ollama is not running, generation falls back to retrieval-only.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower().replace("-", "_")
+OLLAMA_HOST = os.getenv(
+    "OLLAMA_HOST",
+    os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+).rstrip("/")
+OLLAMA_BASE_URL = OLLAMA_HOST  # alias for older env files / docs
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2").strip()
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo").strip()
 LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.3"))
 NOT_FOUND_ANSWER = os.getenv("NOT_FOUND_ANSWER", "Not found")
 MAX_QUESTION_LENGTH = int(os.getenv("MAX_QUESTION_LENGTH", "2000"))
+
+
+def resolve_llm_provider(
+    *,
+    api_key: str | None = None,
+    use_llm: bool = True,
+) -> str:
+    """
+    Resolve the answer-generation backend.
+
+    Returns one of: ``ollama``, ``openai``, ``retrieval_only``.
+
+    Priority:
+      1. ``LLM_PROVIDER=ollama`` → Ollama (llama3.2)
+      2. Else if an OpenAI API key exists → OpenAI
+      3. Else → retrieval-only
+    """
+    if not use_llm:
+        return "retrieval_only"
+
+    key = (api_key if api_key is not None else OPENAI_API_KEY).strip()
+    provider = LLM_PROVIDER
+
+    if provider in ("retrieval_only", "none", "off"):
+        return "retrieval_only"
+    if provider == "ollama":
+        return "ollama"
+    if key:
+        return "openai"
+    return "retrieval_only"
+
+
+def llm_generation_enabled(*, api_key: str | None = None) -> bool:
+    """True when the resolved provider will call an LLM (Ollama or OpenAI)."""
+    return resolve_llm_provider(api_key=api_key) in ("ollama", "openai")
 
 # Observability / logging
 TRACES_DIR = BASE_DIR / "traces"

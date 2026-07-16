@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1
-
+#
+# Lightweight API image — does not bundle Ollama.
+# Run Ollama separately:
+#   - Host install + OLLAMA_HOST=http://host.docker.internal:11434, or
+#   - docker compose --profile ollama up -d  → OLLAMA_HOST=http://ollama:11434
+# Set LLM_PROVIDER=ollama and OLLAMA_MODEL=llama3.2 in .env.
 FROM python:3.12-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
