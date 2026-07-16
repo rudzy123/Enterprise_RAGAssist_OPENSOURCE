@@ -89,7 +89,7 @@ def main() -> int:
         print("Status: READY for generative pipeline")
         return 0
     except Exception as exc:
-        print(f"Status: FAILED — chat error")
+        print("Status: FAILED — chat error")
         print(f"Error:  {exc}")
         return 1
 
